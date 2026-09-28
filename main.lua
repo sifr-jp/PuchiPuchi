@@ -1,7 +1,8 @@
--- Puchipuchi v0.3: bubble wrap popping game (LÖVE 11.x)
+-- Puchipuchi v0.4: bubble wrap popping game (LÖVE 11.x)
 -- v0.2: 行数の自動決定 / 潰れにくさの個体差 / フィルム素材感のある音と描画
--- v0.3: 手応えを重く+押し込み速度のランダム変化 / 音に重みを追加 /
---       「空気は潰れたが素材が伸びて破れない」挙動(変形・きしみ音・戻りの音)
+-- v0.3: 手応えを重く+押し込み速度のランダム変化 / 伸びて潰れない粒 / ミチミチ・ポコッ音
+-- v0.4: なぞり速度で力が変わる / 粒から粒への勢いの持ち越し / ポコッを遅らせる /
+--       ビニール感(フィルムの反射・重なり) / 破裂音に重厚感(低音・サブ帯域・軽い歪み)
 
 local pi = math.pi
 local SAMPLE_RATE = 44100
@@ -10,19 +11,28 @@ local NUM_VARIANTS = 16
 local PRESS_TIME = 0.30      -- 押し込みから破裂までの目安(秒)。大きいほど重い
 local RELEASE_TIME = 0.25    -- 離したときに元に戻るまでの時間(秒)
 local HARD_RATIO = 0.25      -- 「伸びて潰れにくい粒」の割合
-local SOUND_WEIGHT = 1.0     -- 破裂音の低音の重み。大きいほど重く、小さいほど軽い
+local SOUND_WEIGHT = 1.6     -- 破裂音の低音の重み。大きいほど重厚、小さいほど軽い
+local SWIPE_FAST = 12        -- 「速いなぞり」の基準(粒/秒)。大きいほど速くても深く入る
+local SPRING_DELAY_MIN = 0.09  -- 「ポコッ」を指を離してから鳴らすまでの遅れ(秒)
+local SPRING_DELAY_MAX = 0.17
+local CARRY_MAX_GAP = 0.30   -- この時間(秒)以内に次の粒へ移ると、勢いが持ち越される
 local TOP, MARGIN = 60, 16
 local MAX_CELL = 64          -- 粒1つ分の最大サイズ(px)
 
 local rows = 13
 local bubbles, variants = {}, {}
 local stretchSrc, springSrc = {}, {}
-local sheet = { x = 0, y = 0, w = 0, h = 0, sheen = {} }
+local sheet = { x = 0, y = 0, w = 0, h = 0, sheen = {}, creases = {} }
 local popped, total = 0, 0
 local cell = 40
-local creak, creakAt, lastTarget = nil, -1, nil
+local creak, creakAt, springAt = nil, -1, -1
+local lastTarget = nil
+local pending = {}                           -- 遅らせて鳴らす音のキュー
+local mx0, my0, mspeed = nil, nil, 0         -- マウス移動速度(px/秒, 平滑化)
+local leftAt, leftP, leftDwell = -1, 0, 0    -- 直前に離れた粒の記録(勢いの持ち越し用)
 
 local function rand(a, b) return a + (b - a) * love.math.random() end
+local function later(delay, fn) pending[#pending + 1] = { t = delay, fn = fn } end
 
 ---------------------------------------------------------------
 -- 音の合成ユーティリティ
@@ -58,19 +68,23 @@ local function toSource(buf, n, level)
 end
 
 ---------------------------------------------------------------
--- 破裂音: 鋭いクリック + 空気の胴鳴り + 低い胴鳴り(重み) + フィルムの張り + しわしわ
+-- 破裂音: クリック + 空気の胴鳴り + 低い胴鳴り + サブ(100Hz台) + フィルムの張り
+--         + しわしわ + 膜が裂ける高音(ペリッ)
 -- size: 0(小粒・高い音) 〜 1(大粒・低い音)
 ---------------------------------------------------------------
 local function makePop(size)
-  local n = math.floor(SAMPLE_RATE * 0.22)
+  local n = math.floor(SAMPLE_RATE * 0.30)
   local body = bandpass(rand(750, 1200) - size * 400, 1.6)   -- 空気が抜ける胴鳴り
-  local deep = bandpass(rand(320, 480) - size * 100, 1.3)    -- 低い胴鳴り(重み)
+  local deep = bandpass(rand(260, 400) - size * 80, 1.2)     -- 低い胴鳴り(重み)
   local skin = bandpass(rand(2800, 4200) - size * 1000, 1.2) -- フィルムの張り
   local ripple = bandpass(rand(2500, 6000), 2.0)             -- しわのカサカサ
+  local tear = bandpass(rand(5000, 7500), 1.5)               -- 膜が裂ける「ペリッ」
   local tauBody = 0.014 + size * 0.010
-  local tauDeep = 0.028 + size * 0.015
+  local tauDeep = 0.050 + size * 0.020                       -- 低音を長く残す
   local tauSkin = 0.007 + size * 0.005
   local lowF = 175 - 70 * size
+  local subF = 105 - 35 * size                               -- 「ドスッ」のサブ成分
+  local tauSub = 0.030 + size * 0.015
   local crkTau = 0.030 + size * 0.020
   local crkRate = rand(900, 1500)      -- しわクリックの発生頻度(1/秒)。時間とともに減る
   local lp = 0
@@ -85,6 +99,8 @@ local function makePop(size)
     local thick = deep(noise) * math.exp(-t / tauDeep) * 5.0 * SOUND_WEIGHT
     local film = skin(noise) * math.exp(-t / tauSkin) * 1.4
     local thump = math.sin(2 * pi * lowF * t) * math.exp(-t / 0.010) * 0.6 * SOUND_WEIGHT
+    local sub = math.sin(2 * pi * subF * t) * math.exp(-t / tauSub) * 0.9 * SOUND_WEIGHT
+    local tearS = tear(noise) * math.exp(-t / 0.006) * 1.2
 
     local imp = 0                                                       -- まばらな小さな衝撃
     if love.math.random() < crkRate * math.exp(-t / crkTau) / SAMPLE_RATE then
@@ -92,10 +108,13 @@ local function makePop(size)
     end
     local crinkle = ripple(imp) * 4
 
+    local s = crack * 0.8 + air * 0.9 + thick * 0.9 + film * 0.6
+            + thump + sub + crinkle * 3.5 + tearS * 0.5
+    local d = s * 0.8                                                   -- 軽い飽和で密度を出す
     local fade = math.min(1, (n - 1 - i) / 200)                         -- 末尾のプチノイズ防止
-    buf[i] = (crack * 0.8 + air * 0.9 + thick * 0.9 + film * 0.6 + thump + crinkle * 3) * fade
+    buf[i] = (d / (1 + math.abs(d))) * fade
   end
-  return toSource(buf, n, 0.85)
+  return toSource(buf, n, 0.88)
 end
 
 -- 押し始めの「ミシッ」というフィルムのきしみ音
@@ -132,32 +151,32 @@ local function makeStretch()
   return toSource(buf, n, 0.6)
 end
 
--- 押さえていた指を離したとき、伸びた素材が戻って空気が戻る「ポコッ」という音
+-- 伸びた素材が戻って空気が戻る「ポコッ」。v0.3より低く、ピッチの下がり方をゆっくりに
 local function makeSpring()
-  local n = math.floor(SAMPLE_RATE * 0.10)
-  local bp = bandpass(rand(300, 500), 1.5)
-  local f = rand(150, 210)
+  local n = math.floor(SAMPLE_RATE * 0.16)
+  local bp = bandpass(rand(260, 420), 1.5)
+  local f = rand(120, 175)
   local phase = 0
   local buf = {}
   for i = 0, n - 1 do
     local t = i / SAMPLE_RATE
-    local fr = f * (1 + 0.8 * math.exp(-t / 0.012))   -- ピッチが下がる
+    local fr = f * (1 + 0.9 * math.exp(-t / 0.035))   -- ピッチが下がる(ゆっくり)
     phase = phase + 2 * pi * fr / SAMPLE_RATE
     local noise = love.math.random() * 2 - 1
     local fade = math.min(1, (n - 1 - i) / 100)
-    buf[i] = (math.sin(phase) * math.exp(-t / 0.025)
-             + bp(noise) * 0.5 * math.exp(-t / 0.012)) * fade
+    buf[i] = (math.sin(phase) * math.exp(-t / 0.045)
+             + bp(noise) * 0.5 * math.exp(-t / 0.018)) * fade
   end
   return toSource(buf, n, 0.7)
 end
 
-local function playCreak()
+local function playCreak(vol)
   local now = love.timer.getTime()
   if now - creakAt < 0.05 then return end     -- 鳴らしすぎ防止
   creakAt = now
   local s = creak:clone()
   s:setPitch(rand(0.85, 1.25))
-  s:setVolume(rand(0.25, 0.45))
+  s:setVolume(rand(0.25, 0.45) * (vol or 1))
   s:play()
 end
 
@@ -169,6 +188,9 @@ local function playStretch(hard)
 end
 
 local function playSpring(amount)
+  local now = love.timer.getTime()
+  if now - springAt < 0.08 then return end    -- 連続で潰したときに鳴りすぎないように
+  springAt = now
   local s = springSrc[love.math.random(#springSrc)]:clone()
   s:setPitch(rand(0.9, 1.1))
   s:setVolume(math.min(1, 0.3 + 0.6 * amount))
@@ -215,6 +237,7 @@ end
 local function newSheet()
   calcRows()
   bubbles = {}
+  pending = {}
   for r = 1, rows do
     for c = 1, COLS do
       local hard = love.math.random() < HARD_RATIO
@@ -227,28 +250,35 @@ local function newSheet()
         speed = rand(0.7, 1.3),                    -- 粒ごとの押し込み速度の個体差
         seed = rand(0, 100),                       -- 押し込み速度の時間変化用
         held = false, stretched = false,
+        dwell = 0,                                 -- 今回の接触で押し続けた時間
         wobA = 0, wobT = 10,                       -- 離したときの揺れ
         popped = false, t = 0,
         snd = love.math.random(NUM_VARIANTS),
         sz = rand(0.97, 1.03),                     -- 大きさの個体差
         tint = rand(-0.03, 0.03),                  -- 色味の個体差
         hx = rand(-0.35, 0.35), hy = rand(-0.35, 0.35),  -- 破裂後の穴の位置
-        wr = {},                                   -- 破裂後のしわ
+        wr = {},                                   -- 破裂後のしわ(少なめ・太め・柔らかく)
       }
-      for i = 1, 8 do
-        local a, d = rand(0, 2 * pi), rand(0.1, 0.75)
+      for i = 1, 5 do
+        local a, d = rand(0, 2 * pi), rand(0.1, 0.7)
         local x1, y1 = math.cos(a) * d, math.sin(a) * d
-        b.wr[i] = { x1, y1, x1 + rand(-0.45, 0.45), y1 + rand(-0.45, 0.45) }
+        b.wr[i] = { x1, y1, x1 + rand(-0.4, 0.4), y1 + rand(-0.4, 0.4) }
       end
       bubbles[#bubbles + 1] = b
     end
   end
-  sheet.sheen = {}                                 -- 平らなフィルム面のうっすらした筋
+  sheet.sheen = {}                                 -- フィルム面のうっすらした筋
   for i = 1, 10 do
     sheet.sheen[i] = { rand(0, 1), rand(0, 1), rand(0, 1), rand(0, 1) }
   end
+  sheet.creases = {}                               -- 長くて柔らかいしわ(ビニールの折れ)
+  for i = 1, 5 do
+    local y1 = rand(0, 1)
+    sheet.creases[i] = { 0, y1, 1, y1 + rand(-0.25, 0.25), rand(0.05, 0.11) }
+  end
   popped, total = 0, #bubbles
   lastTarget = nil
+  leftAt = -1
   layout()
 end
 
@@ -290,6 +320,7 @@ function love.mousepressed(x, y, button)
   local b = hit(x, y)
   if b and not b.popped then
     b.press = math.max(b.press, rand(0.25, 0.5))      -- 素早いタップ対応
+    b.dwell = 0
     lastTarget = b
     playCreak()
   end
@@ -301,24 +332,63 @@ function love.keypressed(key)
 end
 
 function love.update(dt)
-  local target
-  if love.mouse.isDown(1) then target = hit(love.mouse.getPosition()) end
+  local now = love.timer.getTime()
+  local mx, my = love.mouse.getPosition()
+  local down = love.mouse.isDown(1)
 
-  -- なぞって新しい粒に入ったとき: ランダムな力が加わる
-  -- → 潰れる粒と潰れない粒ができる
+  -- マウス移動速度(平滑化)。なぞりの速さで粒に入る力を変えるために使う
+  if down and mx0 then
+    local dx, dy = mx - mx0, my - my0
+    local inst = math.sqrt(dx * dx + dy * dy) / math.max(dt, 1e-4)
+    mspeed = mspeed + (inst - mspeed) * math.min(1, dt * 10)
+  else
+    mspeed = 0
+  end
+  mx0, my0 = mx, my
+
+  -- 遅らせて鳴らす音
+  for i = #pending, 1, -1 do
+    local p = pending[i]
+    p.t = p.t - dt
+    if p.t <= 0 then
+      table.remove(pending, i)
+      p.fn()
+    end
+  end
+
+  local target
+  if down then target = hit(mx, my) end
+
+  -- なぞって別の粒に入ったとき
+  --  ・ゆっくりなぞるほど深く入り、速いほど浅く触れるだけ
+  --  ・直前の粒での張り具合と滞在時間が、勢いとして次の粒に持ち越される
   if target ~= lastTarget then
+    local prev = lastTarget
+    if prev then
+      leftAt = now
+      leftP = prev.popped and 0.5 or math.min(1, prev.press / prev.thresh)
+      leftDwell = prev.dwell
+    end
     if target and not target.popped then
-      target.press = target.press + rand(0.2, 0.7)
-      playCreak()
+      local slow = 1 - math.min(1, mspeed / (cell * SWIPE_FAST))
+      local force = (0.08 + 0.55 * slow) * rand(0.6, 1.3)
+      local gap = now - leftAt
+      if gap < CARRY_MAX_GAP then
+        local carry = leftP * 0.3 + math.min(leftDwell, 0.6) * 0.3
+        force = force + carry * (1 - gap / CARRY_MAX_GAP) * rand(0.7, 1.2)
+      end
+      target.press = target.press + force
+      target.dwell = 0
+      playCreak(0.5 + 0.5 * slow)
     end
     lastTarget = target
   end
 
-  local now = love.timer.getTime()
   for _, b in ipairs(bubbles) do
     if not b.popped then
       if b == target then
         b.held = true
+        b.dwell = b.dwell + dt
         -- 押し込み速度は粒ごとに違い、しかも時間とともに滑らかに揺らぐ
         local wave = 0.55 + 0.9 * love.math.noise(b.seed, now * 3)
         b.press = b.press + dt / PRESS_TIME * b.speed * wave
@@ -333,8 +403,13 @@ function love.update(dt)
           b.held = false
           local p = math.min(1, b.press / b.thresh)
           if p > 0.35 then
-            playSpring(p)                                  -- 空気が戻る「ポコッ」
-            b.wobA, b.wobT = p, 0                          -- 揺れ
+            -- 空気が戻る「ポコッ」は少し遅れて鳴る。揺れも同じタイミングで始める
+            later(rand(SPRING_DELAY_MIN, SPRING_DELAY_MAX), function()
+              if not b.popped then
+                playSpring(p)
+                b.wobA, b.wobT = p, 0
+              end
+            end)
           end
         end
         b.press = math.max(0, b.press - dt / RELEASE_TIME) -- 離すと戻る
@@ -356,11 +431,39 @@ local function drawSheet()
   love.graphics.setLineWidth(1)
   love.graphics.setColor(0.6, 0.78, 0.92, 0.7)
   love.graphics.rectangle("line", sheet.x, sheet.y, sheet.w, sheet.h, 10, 10)
-  love.graphics.setColor(1, 1, 1, 0.16)                          -- うっすらした光の筋
+end
+
+-- 粒の上に重ねるフィルムの反射。マウスの位置で光の帯が動く
+local function drawFilm()
+  love.graphics.setScissor(sheet.x, sheet.y, sheet.w, sheet.h)
+
+  local W = love.graphics.getWidth()
+  local mxr = math.max(0, math.min(1, love.mouse.getX() / W))
+  local skew = sheet.h * 0.35
+  local bw = sheet.w * 0.16
+  local gx = sheet.x + sheet.w * (0.1 + 0.9 * mxr)
+  love.graphics.setColor(1, 1, 1, 0.10)                          -- 太い光の帯
+  love.graphics.polygon("fill", gx, sheet.y, gx + bw, sheet.y,
+                        gx + bw - skew, sheet.y + sheet.h, gx - skew, sheet.y + sheet.h)
+  local gx2 = gx + bw * 1.6
+  love.graphics.setColor(1, 1, 1, 0.06)                          -- 細い光の帯
+  love.graphics.polygon("fill", gx2, sheet.y, gx2 + bw * 0.3, sheet.y,
+                        gx2 + bw * 0.3 - skew, sheet.y + sheet.h, gx2 - skew, sheet.y + sheet.h)
+
+  love.graphics.setLineWidth(1)
+  love.graphics.setColor(1, 1, 1, 0.14)                          -- うっすらした光の筋
   for _, s in ipairs(sheet.sheen) do
     love.graphics.line(sheet.x + s[1] * sheet.w, sheet.y + s[2] * sheet.h,
                        sheet.x + s[3] * sheet.w, sheet.y + s[4] * sheet.h)
   end
+  love.graphics.setLineWidth(3)                                  -- ビニールの折れ(長く柔らかい)
+  for _, c in ipairs(sheet.creases) do
+    love.graphics.setColor(1, 1, 1, c[5])
+    love.graphics.line(sheet.x + c[1] * sheet.w, sheet.y + c[2] * sheet.h,
+                       sheet.x + c[3] * sheet.w, sheet.y + c[4] * sheet.h)
+  end
+
+  love.graphics.setScissor()
 end
 
 local function drawIntact(b)
@@ -379,19 +482,24 @@ local function drawIntact(b)
 
   love.graphics.setColor(0, 0.1, 0.2, 0.14)                     -- 影
   love.graphics.circle("fill", r * 0.12, r * 0.18, r)
-  love.graphics.setColor(0.75 + tn, 0.9 + tn, 1, 0.34 + 0.10 * p)  -- 本体(張るほど濃く)
+  love.graphics.setColor(0.75 + tn, 0.9 + tn, 1, 0.30 + 0.10 * p)  -- 本体(張るほど濃く)
   love.graphics.circle("fill", 0, 0, r)
   love.graphics.setColor(0.35, 0.6, 0.85, 0.28)                 -- 右下の厚みのある陰
   love.graphics.setLineWidth(r * 0.14)
   love.graphics.arc("line", "open", 0, 0, r * 0.86, -0.1, 1.6)
+  love.graphics.setColor(0.5, 0.75, 0.95, 0.22)                 -- 内側の縁(透明な膜の厚み)
+  love.graphics.setLineWidth(1)
+  love.graphics.circle("line", 0, 0, r * 0.74)
   love.graphics.setColor(0.5, 0.75, 0.95, 0.8)                  -- 縁
   love.graphics.setLineWidth(1.5)
   love.graphics.circle("line", 0, 0, r)
-  love.graphics.setColor(1, 1, 1, 0.9 - 0.55 * p)               -- ハイライト
-  love.graphics.ellipse("fill", -r * 0.3, -r * 0.35, r * 0.28, r * 0.16)
-  love.graphics.setColor(1, 1, 1, 0.5 - 0.3 * p)                -- 小さな2つ目のハイライト
+  love.graphics.setColor(1, 1, 1, 0.10)                         -- 広く柔らかい光沢
+  love.graphics.circle("fill", -r * 0.2, -r * 0.25, r * 0.55)
+  love.graphics.setColor(1, 1, 1, 0.70 - 0.45 * p)              -- ハイライト(伸びるほど横に歪む)
+  love.graphics.ellipse("fill", -r * 0.3, -r * 0.35, r * (0.26 + 0.16 * p * hk), r * 0.14)
+  love.graphics.setColor(1, 1, 1, 0.45 - 0.25 * p)              -- 小さな2つ目のハイライト
   love.graphics.circle("fill", r * 0.35, r * 0.4, r * 0.06)
-  love.graphics.setColor(1, 1, 1, 0.22)                         -- 反射光
+  love.graphics.setColor(1, 1, 1, 0.18)                         -- 反射光
   love.graphics.arc("fill", 0, 0, r * 0.8, 0.2, 1.0)
 
   local sa = math.max(0, p - 0.5) * 2 * (b.hard and 0.45 or 0.25)
@@ -416,12 +524,13 @@ local function drawPopped(b)
   love.graphics.setColor(0.5, 0.65, 0.8, 0.5)
   love.graphics.setLineWidth(1)
   love.graphics.circle("line", b.x, b.y, r)
-  for _, w in ipairs(b.wr) do                                   -- しわ(光る面と影の面)
-    love.graphics.setColor(1, 1, 1, 0.55)
+  love.graphics.setLineWidth(2)
+  for _, w in ipairs(b.wr) do                                   -- しわ(太めで淡く、柔らかく)
+    love.graphics.setColor(1, 1, 1, 0.40)
     love.graphics.line(b.x + w[1] * r, b.y + w[2] * r, b.x + w[3] * r, b.y + w[4] * r)
-    love.graphics.setColor(0.4, 0.6, 0.8, 0.35)
-    love.graphics.line(b.x + w[1] * r + 1, b.y + w[2] * r + 1,
-                       b.x + w[3] * r + 1, b.y + w[4] * r + 1)
+    love.graphics.setColor(0.4, 0.6, 0.8, 0.22)
+    love.graphics.line(b.x + w[1] * r + 1.5, b.y + w[2] * r + 1.5,
+                       b.x + w[3] * r + 1.5, b.y + w[4] * r + 1.5)
   end
   love.graphics.setColor(0.3, 0.45, 0.6, 0.45)                  -- 破れた小さな穴
   love.graphics.ellipse("fill", b.x + b.hx * r, b.y + b.hy * r, r * 0.07, r * 0.045)
@@ -442,6 +551,7 @@ function love.draw()
   for _, b in ipairs(bubbles) do
     if b.popped then drawPopped(b) else drawIntact(b) end
   end
+  drawFilm()
   love.graphics.setColor(0.2, 0.3, 0.4)
   love.graphics.print(string.format("%d / %d   [R] reset", popped, total), 16, 20)
   if popped == total then
