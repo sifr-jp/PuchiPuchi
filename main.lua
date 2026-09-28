@@ -5,6 +5,10 @@
 --       ビニール感(フィルムの反射・重なり) / 破裂音に重厚感(低音・サブ帯域・軽い歪み)
 -- v0.5: 破裂音を6種類に(通常/鋭い/深い/二段/プシュ/こもり)。同じ音が続けて鳴らないようにした
 -- v0.6: シートを長方形に切り出し、縁の空きを半割の粒で埋める(破裂しない)。カッターで切った縁の表現
+-- v0.7: 表示文字を大きく / リセットを Shift+R に変更
+-- v0.8: 文字を少し小さく / 中央に経過時間を表示 / リセットを R だけに戻す
+-- v0.9: 経過時間を 1/100 秒まで表示
+-- v0.10: R が効かない問題の対策(日本語入力の横取りを避けるためテキスト入力を切り、物理キーでも判定)
 
 local pi = math.pi
 local SAMPLE_RATE = 44100
@@ -19,6 +23,8 @@ local SPRING_DELAY_MIN = 0.09  -- 「ポコッ」を指を離してから鳴ら�
 local SPRING_DELAY_MAX = 0.17
 local CARRY_MAX_GAP = 0.30   -- この時間(秒)以内に次の粒へ移ると、勢いが持ち越される
 local TOP, MARGIN = 60, 16
+local HUD_SIZE = 20         -- 上部の表示文字の大きさ(px)
+local MSG_SIZE = 24         -- 全部潰したときのメッセージの大きさ(px)
 local MAX_CELL = 64          -- 粒1つ分の最大サイズ(px)
 
 local rows = 13
@@ -29,6 +35,8 @@ local popped, total = 0, 0
 local cell = 40
 local creak, creakAt, springAt = nil, -1, -1
 local lastTarget = nil
+local elapsed, timing = 0, false             -- 経過時間(秒)と計測中かどうか
+local hudFont, msgFont                        -- 表示用フォント
 local lastPopIdx = nil                       -- 直前に鳴らした破裂音(連続を避ける)
 local pending = {}                           -- 遅らせて鳴らす音のキュー
 local mx0, my0, mspeed = nil, nil, 0         -- マウス移動速度(px/秒, 平滑化)
@@ -358,6 +366,7 @@ local function newSheet()
   end
   lastTarget = nil
   leftAt = -1
+  elapsed, timing = 0, false
   layout()
   popped, total = 0, 0                             -- 半割の粒は数えない
   for _, b in ipairs(bubbles) do
@@ -385,7 +394,10 @@ end
 -- LÖVE コールバック
 ---------------------------------------------------------------
 function love.load()
+  love.keyboard.setTextInput(false)     -- 日本語入力(IME)がキーを横取りしないようにする
   love.graphics.setBackgroundColor(0.86, 0.92, 0.96)
+  hudFont = love.graphics.newFont(HUD_SIZE)
+  msgFont = love.graphics.newFont(MSG_SIZE)
   love.math.setRandomSeed(os.time())
   local wsum = 0
   for _, k in ipairs(POP_ORDER) do wsum = wsum + POP_KINDS[k].w end
@@ -423,8 +435,8 @@ function love.mousepressed(x, y, button)
   end
 end
 
-function love.keypressed(key)
-  if key == "r" then newSheet() end
+function love.keypressed(key, scancode)
+  if key == "r" or scancode == "r" then newSheet() end   -- キー配列に関係なく物理的なRキーでも反応
   if key == "escape" then love.event.quit() end
 end
 
@@ -455,6 +467,8 @@ function love.update(dt)
 
   local target
   if down then target = hit(mx, my) end
+  if target then timing = true end                            -- 最初に粒に触れたら計測開始
+  if timing and popped < total then elapsed = elapsed + dt end -- 全部潰したら止まる
 
   -- なぞって別の粒に入ったとき
   --  ・ゆっくりなぞるほど深く入り、速いほど浅く触れるだけ
@@ -689,6 +703,12 @@ local function drawCutEdges()
   wobLine(x1, y0, x1, y1, wb.right, false, 0)
 end
 
+-- 経過時間を「分:秒.1/100秒」にする
+local function fmtTime(sec)
+  local cs = math.floor(sec * 100)                 -- 1/100秒単位の整数
+  return string.format("%d:%02d.%02d", math.floor(cs / 6000), math.floor(cs / 100) % 60, cs % 100)
+end
+
 function love.draw()
   drawSheet()
   love.graphics.setScissor(sheet.x, sheet.y, sheet.w, sheet.h)   -- 縁の外にはみ出した粒を切り落とす
@@ -698,10 +718,20 @@ function love.draw()
   love.graphics.setScissor()
   drawFilm()
   drawCutEdges()
+  local W, H = love.graphics.getDimensions()
+  love.graphics.setFont(hudFont)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.print(string.format("%d / %d   [R] reset", popped, total), 16, 20)
-  if popped == total then
-    love.graphics.printf("All popped! Tap to start again", 0, 24,
-                         love.graphics.getWidth(), "center")
+  love.graphics.print(string.format("%d / %d", popped, total), 16, 18)          -- 左: 潰した数
+  love.graphics.printf(fmtTime(elapsed), 0, 18, W, "center")                    -- 中央: 経過時間
+  love.graphics.printf("[R] reset", 0, 18, W - 16, "right")                     -- 右: リセット
+  if popped == total then                                       -- 全部潰したら画面中央にメッセージ
+    love.graphics.setFont(msgFont)
+    local line1 = "All popped!  " .. fmtTime(elapsed)
+    local bw = math.max(msgFont:getWidth(line1), msgFont:getWidth("Tap to start again")) + 48
+    local bh = msgFont:getHeight() * 2 + 32
+    love.graphics.setColor(1, 1, 1, 0.80)
+    love.graphics.rectangle("fill", (W - bw) / 2, (H - bh) / 2, bw, bh, 14, 14)
+    love.graphics.setColor(0.2, 0.3, 0.4)
+    love.graphics.printf(line1 .. "\nTap to start again", 0, (H - bh) / 2 + 16, W, "center")
   end
 end
