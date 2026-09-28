@@ -1,288 +1,126 @@
--- Puchipuchi v0.4: bubble wrap popping game (LÖVE 11.x)
--- v0.2: 行数の自動決定 / 潰れにくさの個体差 / フィルム素材感のある音と描画
--- v0.3: 手応えを重く+押し込み速度のランダム変化 / 伸びて潰れない粒 / ミチミチ・ポコッ音
--- v0.4: なぞり速度で力が変わる / 粒から粒への勢いの持ち越し / ポコッを遅らせる /
---       ビニール感(フィルムの反射・重なり) / 破裂音に重厚感(低音・サブ帯域・軽い歪み)
--- v0.5: 破裂音を6種類に(通常/鋭い/深い/二段/プシュ/こもり)。同じ音が続けて鳴らないようにした
--- v0.6: シートを長方形に切り出し、縁の空きを半割の粒で埋める(破裂しない)。カッターで切った縁の表現
--- v0.7: 表示文字を大きく / リセットを Shift+R に変更
--- v0.8: 文字を少し小さく / 中央に経過時間を表示 / リセットを R だけに戻す
--- v0.9: 経過時間を 1/100 秒まで表示
--- v0.10: R が効かない問題の対策(日本語入力の横取りを避けるためテキスト入力を切り、物理キーでも判定)
+-- Puchipuchi v1.0: bubble wrap popping game (LÖVE 11.x)
+-- Lv1-1 Training : ウィンドウの大きさに合わせて行数が変わる(これまでのステージ)
+-- Lv1-2 Big Sheet: 画面サイズ固定 / 約300粒 / スクロール / 指のカーソル / 自己ベストを記録
+--
+-- ファイル構成
+--   main.lua     ゲーム本体(このファイル)
+--   sound.lua    音の合成
+--   records.lua  記録の保存
+--   finger.lua   指のカーソル
+--   stages.lua   ステージ設定の表
+--
+-- 履歴
+--   v0.2〜v0.10: 素材感・音・手応え・半割の粒・時間表示など(ステージ1)
+--   v1.0: ステージ選択 / スクロール / 指のカーソル / 記録 / ファイル分割
+
+local Sound = require("sound")
+local Records = require("records")
+local Finger = require("finger")
+local STAGES = require("stages")
 
 local pi = math.pi
-local SAMPLE_RATE = 44100
-local COLS = 8
-local NUM_VARIANTS = 24        -- 破裂音のバリエーション数(6種類の音を混ぜる)
-local PRESS_TIME = 0.30      -- 押し込みから破裂までの目安(秒)。大きいほど重い
-local RELEASE_TIME = 0.25    -- 離したときに元に戻るまでの時間(秒)
-local HARD_RATIO = 0.25      -- 「伸びて潰れにくい粒」の割合
-local SOUND_WEIGHT = 1.6     -- 破裂音の低音の重み。大きいほど重厚、小さいほど軽い
-local SWIPE_FAST = 12        -- 「速いなぞり」の基準(粒/秒)。大きいほど速くても深く入る
-local SPRING_DELAY_MIN = 0.09  -- 「ポコッ」を指を離してから鳴らすまでの遅れ(秒)
-local SPRING_DELAY_MAX = 0.17
-local CARRY_MAX_GAP = 0.30   -- この時間(秒)以内に次の粒へ移ると、勢いが持ち越される
-local TOP, MARGIN = 60, 16
-local HUD_SIZE = 20         -- 上部の表示文字の大きさ(px)
-local MSG_SIZE = 24         -- 全部潰したときのメッセージの大きさ(px)
-local MAX_CELL = 64          -- 粒1つ分の最大サイズ(px)
 
+---------------------------------------------------------------
+-- 調整用の定数
+---------------------------------------------------------------
+local RELEASE_TIME = 0.25       -- 離したときに元に戻るまでの時間(秒)
+local SWIPE_FAST = 12           -- 「速いなぞり」の基準(粒/秒)。大きいほど速くても深く入る
+local SPRING_DELAY_MIN = 0.09   -- 「ポコッ」を指を離してから鳴らすまでの遅れ(秒)
+local SPRING_DELAY_MAX = 0.17
+local CARRY_MAX_GAP = 0.30      -- この時間(秒)以内に次の粒へ移ると、勢いが持ち越される
+local TOP, MARGIN = 60, 16      -- シート上端の位置 / 画面端の余白
+local HUD_H = 50                -- 上部の表示エリアの高さ(スクロール時、ここより上は隠れる)
+local HUD_SIZE = 20             -- 上部の表示文字の大きさ(px)
+local MSG_SIZE = 24             -- メッセージの文字の大きさ(px)
+local TITLE_SIZE = 44           -- タイトルの文字の大きさ(px)
+local FIXED_W, FIXED_H = 480, 800   -- 固定ステージの画面サイズ(ウィンドウが違っても縮尺で合わせる)
+local SCROLL_WHEEL = 80         -- マウスホイール1目盛りのスクロール量(px)
+local SCROLL_KEY = 700          -- 矢印キー・W/Sのスクロール速度(px/秒)
+local EDGE_ZONE = 45            -- 押したまま上下の端へ動かすと自動スクロールする範囲(px)
+local EDGE_SPEED = 380          -- そのときのスクロール速度(px/秒)
+local FINISH_LOCK = 0.8         -- 全部潰した直後、この時間(秒)はクリックしてもリセットしない
+
+---------------------------------------------------------------
+-- 状態
+---------------------------------------------------------------
+local scene = "menu"                          -- "menu" か "play"
+local stage = nil                             -- 遊んでいるステージの設定(stages.lua)
+local view = { w = FIXED_W, h = FIXED_H, scale = 1, ox = 0, oy = 0 }
 local rows = 13
-local bubbles, variants = {}, {}
-local stretchSrc, springSrc = {}, {}
+local bubbles = {}
 local sheet = { x = 0, y = 0, w = 0, h = 0, sheen = {}, creases = {}, wob = {} }
 local popped, total = 0, 0
 local cell = 40
-local creak, creakAt, springAt = nil, -1, -1
+local scrollY, maxScroll = 0, 0
 local lastTarget = nil
-local elapsed, timing = 0, false             -- 経過時間(秒)と計測中かどうか
-local hudFont, msgFont                        -- 表示用フォント
-local lastPopIdx = nil                       -- 直前に鳴らした破裂音(連続を避ける)
-local pending = {}                           -- 遅らせて鳴らす音のキュー
-local mx0, my0, mspeed = nil, nil, 0         -- マウス移動速度(px/秒, 平滑化)
-local leftAt, leftP, leftDwell = -1, 0, 0    -- 直前に離れた粒の記録(勢いの持ち越し用)
+local pending = {}                            -- 遅らせて鳴らす音のキュー
+local mx0, my0, mspeed = nil, nil, 0          -- マウス移動速度(px/秒, 平滑化)
+local sy0, edgeDir = nil, 0                   -- 端への自動スクロール用
+local leftAt, leftP, leftDwell = -1, 0, 0     -- 直前に離れた粒の記録(勢いの持ち越し用)
+local elapsed, timing = 0, false              -- 経過時間(秒)と計測中かどうか
+local finished, finishAt, finishInfo = false, 0, nil
+local fingerPress = 0                         -- 指カーソルの押し込み量(0〜1)
+local hudFont, msgFont, titleFont
 
 local function rand(a, b) return a + (b - a) * love.math.random() end
 local function later(delay, fn) pending[#pending + 1] = { t = delay, fn = fn } end
+local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
 
----------------------------------------------------------------
--- 音の合成ユーティリティ
----------------------------------------------------------------
--- バンドパスフィルタ(双2次)。ノイズに「帯域の色」を付けるのに使う
-local function bandpass(f, q)
-  local w0 = 2 * pi * f / SAMPLE_RATE
-  local alpha = math.sin(w0) / (2 * q)
-  local a0 = 1 + alpha
-  local b0 = alpha / a0
-  local b2 = -alpha / a0
-  local a1 = -2 * math.cos(w0) / a0
-  local a2 = (1 - alpha) / a0
-  local x1, x2, y1, y2 = 0, 0, 0, 0
-  return function(x)
-    local y = b0 * x + b2 * x2 - a1 * y1 - a2 * y2
-    x2, x1 = x1, x
-    y2, y1 = y1, y
-    return y
-  end
+local function useFinger()
+  local os_ = love.system.getOS()
+  return stage ~= nil and stage.finger and os_ ~= "Android" and os_ ~= "iOS"
 end
 
-local function toSource(buf, n, level)
-  local peak = 1e-9
-  for i = 0, n - 1 do
-    local a = math.abs(buf[i])
-    if a > peak then peak = a end
-  end
-  local sd = love.sound.newSoundData(n, SAMPLE_RATE, 16, 1)
-  local g = level / peak
-  for i = 0, n - 1 do sd:setSample(i, buf[i] * g) end
-  return love.audio.newSource(sd, "static")
+-- 経過時間を「分:秒.1/100秒」にする
+local function fmtTime(sec)
+  local cs = math.floor(sec * 100)                 -- 1/100秒単位の整数
+  return string.format("%d:%02d.%02d", math.floor(cs / 6000), math.floor(cs / 100) % 60, cs % 100)
 end
 
 ---------------------------------------------------------------
--- 破裂音の種類。粒ごとに違う「プチッ」を出すため、構造の違う音を複数用意する
---   w: 出現の重み  level: 音量  dur: 長さ(秒)
---   crack/air/thick/film/thump/sub/crinkle/tear: 各成分の量
---   bright: 高域の周波数倍率  tau: 余韻の長さ倍率
---   double: 2段階で裂ける  hiss: 空気がゆっくり漏れる  dull: こもり具合(0.1〜0.3)
---   sizeMin/sizeMax: 粒の大きさ(0=小さく高い音, 1=大きく低い音)
+-- 画面(view): 固定ステージは 480x800 の仮想画面をウィンドウに合わせて拡大縮小する
 ---------------------------------------------------------------
-local POP_KINDS = {
-  normal = { w = 4, level = 0.88, dur = 0.30, crack = 0.8, air = 0.9, thick = 0.9, film = 0.6,
-             thump = 1.0, sub = 1.0, crinkle = 3.5, tear = 0.5, bright = 1.0, tau = 1.0,
-             sizeMin = 0.10, sizeMax = 0.55 },                       -- 標準の「プチッ」
-  sharp  = { w = 3, level = 0.80, dur = 0.22, crack = 1.3, air = 0.5, thick = 0.3, film = 1.2,
-             thump = 0.4, sub = 0.25, crinkle = 3.0, tear = 1.1, bright = 1.25, tau = 0.6,
-             sizeMin = 0.00, sizeMax = 0.25 },                       -- 薄い膜の高く鋭い「パチッ」
-  deep   = { w = 2, level = 0.90, dur = 0.36, crack = 0.6, air = 1.0, thick = 1.4, film = 0.35,
-             thump = 1.4, sub = 1.5, crinkle = 1.5, tear = 0.2, bright = 0.8, tau = 1.5,
-             sizeMin = 0.45, sizeMax = 0.75 },                       -- 大きく重い「ボスッ」
-  double = { w = 2, level = 0.88, dur = 0.32, crack = 0.8, air = 0.9, thick = 0.8, film = 0.7,
-             thump = 0.9, sub = 0.8, crinkle = 3.5, tear = 0.6, bright = 1.05, tau = 0.9,
-             double = true, sizeMin = 0.10, sizeMax = 0.50 },        -- 2段階で裂ける「プチッ・ピッ」
-  hiss   = { w = 1, level = 0.78, dur = 0.38, crack = 0.7, air = 0.7, thick = 0.6, film = 0.5,
-             thump = 0.6, sub = 0.5, crinkle = 2.0, tear = 0.4, bright = 1.0, tau = 1.0,
-             hiss = 3.5, sizeMin = 0.15, sizeMax = 0.50 },           -- 空気が漏れる「プシュッ」
-  dull   = { w = 2, level = 0.82, dur = 0.28, crack = 0.4, air = 1.1, thick = 1.1, film = 0.15,
-             thump = 1.0, sub = 1.0, crinkle = 1.0, tear = 0.0, bright = 0.9, tau = 1.1,
-             dull = 0.16, sizeMin = 0.15, sizeMax = 0.60 },          -- こもった「ポフッ」
-}
-local POP_ORDER = { "normal", "sharp", "deep", "double", "hiss", "dull" }
-
----------------------------------------------------------------
--- 破裂音: クリック + 空気の胴鳴り + 低い胴鳴り + サブ(100Hz台) + フィルムの張り
---         + しわしわ + 膜が裂ける高音(ペリッ)  ※成分の量は種類(kind)ごとに変わる
--- size: 0(小粒・高い音) 〜 1(大粒・低い音)
----------------------------------------------------------------
-local function makePop(size, kind)
-  local K = POP_KINDS[kind]
-  local n = math.floor(SAMPLE_RATE * K.dur)
-  local body = bandpass(rand(750, 1200) - size * 400, 1.6)   -- 空気が抜ける胴鳴り
-  local deep = bandpass(rand(260, 400) - size * 80, 1.2)     -- 低い胴鳴り(重み)
-  local skin = bandpass((rand(2800, 4200) - size * 1000) * K.bright, 1.2)  -- フィルムの張り
-  local ripple = bandpass(rand(2500, 6000), 2.0)             -- しわのカサカサ
-  local tear = bandpass(math.min(9000, rand(5000, 7500) * K.bright), 1.5)  -- 膜が裂ける「ペリッ」
-  local body2 = bandpass(rand(900, 1400), 1.6)               -- 2段目の胴鳴り(double用)
-  local skin2 = bandpass(rand(3500, 5200), 1.2)              -- 2段目の張り(double用)
-  local hissBp = bandpass(rand(2500, 4500), 0.9)             -- 漏れる空気(hiss用)
-  local tauBody = (0.014 + size * 0.010) * K.tau
-  local tauDeep = (0.050 + size * 0.020) * K.tau             -- 低音を長く残す
-  local tauSkin = (0.007 + size * 0.005) * K.tau
-  local lowF = 175 - 70 * size
-  local subF = 105 - 35 * size                               -- 「ドスッ」のサブ成分
-  local tauSub = (0.030 + size * 0.015) * K.tau
-  local crkTau = 0.030 + size * 0.020
-  local crkRate = rand(900, 1500)      -- しわクリックの発生頻度(1/秒)。時間とともに減る
-  local td = K.double and rand(0.014, 0.034) or 1e9          -- 2段目が裂けるまでの時間
-  local lp, dl = 0, 0
-  local buf = {}
-
-  for i = 0, n - 1 do
-    local t = i / SAMPLE_RATE
-    local noise = love.math.random() * 2 - 1
-    lp = lp + 0.5 * (noise - lp)
-    local hf = noise - lp
-    local crack = hf * math.exp(-t / 0.0004) * 1.5
-    local air = body(noise) * math.exp(-t / tauBody) * 3.0
-    local thick = deep(noise) * math.exp(-t / tauDeep) * 5.0 * SOUND_WEIGHT
-    local film = skin(noise) * math.exp(-t / tauSkin) * 1.4
-    local thump = math.sin(2 * pi * lowF * t) * math.exp(-t / 0.010) * 0.6 * SOUND_WEIGHT
-    local sub = math.sin(2 * pi * subF * t) * math.exp(-t / tauSub) * 0.9 * SOUND_WEIGHT
-    local tearS = tear(noise) * math.exp(-t / 0.006) * 1.2
-
-    local imp = 0                                                       -- まばらな小さな衝撃
-    if love.math.random() < crkRate * math.exp(-t / crkTau) / SAMPLE_RATE then
-      imp = (love.math.random() * 2 - 1) * rand(0.4, 1.0)
-    end
-    local crinkle = ripple(imp) * 4
-
-    local s = crack * K.crack + air * K.air + thick * K.thick + film * K.film
-            + thump * K.thump + sub * K.sub + crinkle * K.crinkle + tearS * K.tear
-
-    if t >= td then                                                     -- 2段目の小さな破裂
-      local t2 = t - td
-      s = s + (hf * math.exp(-t2 / 0.0005) * 1.1
-             + body2(noise) * math.exp(-t2 / 0.012) * 2.0
-             + skin2(noise) * math.exp(-t2 / 0.006) * 1.0) * 0.7
-    end
-    if K.hiss then                                                      -- 空気がゆっくり漏れる
-      s = s + hissBp(noise) * math.min(1, t / 0.008) * math.exp(-t / 0.10) * K.hiss
-    end
-    if K.dull then                                                      -- こもらせる(ローパス)
-      dl = dl + K.dull * (s - dl)
-      s = dl
-    end
-
-    local d = s * 0.8                                                   -- 軽い飽和で密度を出す
-    local fade = math.min(1, (n - 1 - i) / 200)                         -- 末尾のプチノイズ防止
-    buf[i] = (d / (1 + math.abs(d))) * fade
+local function updateView()
+  local W, H = love.graphics.getDimensions()
+  if scene == "play" and stage and stage.free then
+    view.w, view.h, view.scale, view.ox, view.oy = W, H, 1, 0, 0
+  else
+    view.w, view.h = FIXED_W, FIXED_H
+    view.scale = math.min(W / FIXED_W, H / FIXED_H)
+    view.ox = (W - FIXED_W * view.scale) / 2
+    view.oy = (H - FIXED_H * view.scale) / 2
   end
-  return { src = toSource(buf, n, K.level), size = size, kind = kind }
 end
 
--- 押し始めの「ミシッ」というフィルムのきしみ音
-local function makeCreak()
-  local n = math.floor(SAMPLE_RATE * 0.06)
-  local bp = bandpass(rand(1400, 2200), 2.5)
-  local buf = {}
-  for i = 0, n - 1 do
-    local t = i / SAMPLE_RATE
-    local imp = 0
-    if love.math.random() < 500 / SAMPLE_RATE then imp = love.math.random() * 2 - 1 end
-    local noise = (love.math.random() * 2 - 1) * 0.08
-    buf[i] = bp(imp * 4 + noise) * math.exp(-t / 0.02)
-  end
-  return toSource(buf, n, 0.5)
+-- マウス位置(仮想画面の座標)
+local function mousePos()
+  local x, y = love.mouse.getPosition()
+  return (x - view.ox) / view.scale, (y - view.oy) / view.scale
 end
 
--- 素材が伸びるときの「ミチミチ…」という音(引っ掛かりと滑りの繰り返し)
-local function makeStretch()
-  local n = math.floor(SAMPLE_RATE * 0.16)
-  local bp = bandpass(rand(700, 1100), 3.0)
-  local bp2 = bandpass(rand(1800, 2600), 2.5)
-  local pulse = rand(55, 85)          -- 引っ掛かり→滑りの周期(Hz)
-  local buf = {}
-  for i = 0, n - 1 do
-    local t = i / SAMPLE_RATE
-    local noise = love.math.random() * 2 - 1
-    local saw = (t * pulse) % 1
-    local amp = 0.35 + 0.65 * saw
-    local env = math.min(1, t / 0.02) * math.exp(-t / 0.07)
-    local fade = math.min(1, (n - 1 - i) / 200)
-    buf[i] = (bp(noise) * 1.6 + bp2(noise) * 0.6) * amp * env * fade
-  end
-  return toSource(buf, n, 0.6)
+-- 仮想画面の座標でシザー(描画範囲の制限)を設定する
+local function setScissor(x, y, w, h)
+  local s = view.scale
+  love.graphics.setScissor(math.floor(view.ox + x * s), math.floor(view.oy + y * s),
+                           math.ceil(w * s), math.ceil(h * s))
 end
 
--- 伸びた素材が戻って空気が戻る「ポコッ」。v0.3より低く、ピッチの下がり方をゆっくりに
-local function makeSpring()
-  local n = math.floor(SAMPLE_RATE * 0.16)
-  local bp = bandpass(rand(260, 420), 1.5)
-  local f = rand(120, 175)
-  local phase = 0
-  local buf = {}
-  for i = 0, n - 1 do
-    local t = i / SAMPLE_RATE
-    local fr = f * (1 + 0.9 * math.exp(-t / 0.035))   -- ピッチが下がる(ゆっくり)
-    phase = phase + 2 * pi * fr / SAMPLE_RATE
-    local noise = love.math.random() * 2 - 1
-    local fade = math.min(1, (n - 1 - i) / 100)
-    buf[i] = (math.sin(phase) * math.exp(-t / 0.045)
-             + bp(noise) * 0.5 * math.exp(-t / 0.018)) * fade
-  end
-  return toSource(buf, n, 0.7)
-end
-
-local function playCreak(vol)
-  local now = love.timer.getTime()
-  if now - creakAt < 0.05 then return end     -- 鳴らしすぎ防止
-  creakAt = now
-  local s = creak:clone()
-  s:setPitch(rand(0.85, 1.25))
-  s:setVolume(rand(0.25, 0.45) * (vol or 1))
-  s:play()
-end
-
-local function playStretch(hard)
-  local s = stretchSrc[love.math.random(#stretchSrc)]:clone()
-  s:setPitch(rand(0.85, 1.15))
-  s:setVolume(hard and rand(0.5, 0.8) or rand(0.3, 0.5))
-  s:play()
-end
-
-local function playSpring(amount)
-  local now = love.timer.getTime()
-  if now - springAt < 0.08 then return end    -- 連続で潰したときに鳴りすぎないように
-  springAt = now
-  local s = springSrc[love.math.random(#springSrc)]:clone()
-  s:setPitch(rand(0.9, 1.1))
-  s:setVolume(math.min(1, 0.3 + 0.6 * amount))
-  s:play()
-end
-
-local function playPop(b)
-  local idx = b.snd
-  if idx == lastPopIdx then idx = idx % NUM_VARIANTS + 1 end   -- 同じ音が続けて鳴らないように
-  lastPopIdx = idx
-  local v = variants[idx]
-  local src = v.src:clone()          -- 重ねて鳴らせるようにクローン
-  src:setPitch(rand(0.82, 1.10))
-  src:setVolume(rand(0.7, 1.0))
-  src:play()
-  if love.system.vibrate then        -- 非対応環境では何もしない
-    love.system.vibrate(0.012 + 0.015 * v.size)
-  end
+local function scrollBy(d)
+  scrollY = clamp(scrollY + d, 0, maxScroll)
 end
 
 ---------------------------------------------------------------
 -- シートの生成とレイアウト
 ---------------------------------------------------------------
--- 画面サイズから粒の大きさと行数を決める(縦の余白に合わせて行数が変わる)
 local function calcRows()
-  local W, H = love.graphics.getDimensions()
-  cell = math.min((W - 2 * MARGIN) / COLS, MAX_CELL)   -- シートの幅 = 粒COLS個分(半割の粒が縁を埋める)
-  local y1 = H - MARGIN                                 -- シート下端(ここで切る)
-  -- 下端に少しでも見える行まで作る。下端にかかる行は半割になる
-  rows = math.max(1, math.ceil((y1 - TOP - 0.19 * cell) / (cell * 0.87)))
+  cell = math.min((view.w - 2 * MARGIN) / stage.cols, stage.maxCell or 64)
+  if stage.free then
+    -- 下端に少しでも見える行まで作る。下端にかかる行は半割になる
+    local y1 = view.h - MARGIN
+    rows = math.max(1, math.ceil((y1 - TOP - 0.19 * cell) / (cell * 0.87)))
+  else
+    rows = stage.rows
+  end
 end
 
 -- カッターの縁の手ぶれ。一定間隔ごとの小さなずれ(時々刃が引っ掛かる)
@@ -298,8 +136,8 @@ local function makeWob(len)
 end
 
 local function layout()
-  local W, H = love.graphics.getDimensions()
-  local ox = (W - COLS * cell) / 2
+  local cols = stage.cols
+  local ox = (view.w - cols * cell) / 2
   for _, b in ipairs(bubbles) do
     local off = (b.r % 2 == 0) and 0.5 or 0        -- 千鳥配置
     b.x = ox + (b.c - 1 + 0.5 + off) * cell
@@ -308,10 +146,18 @@ local function layout()
   end
   sheet.x = math.floor(ox + 0.5)
   sheet.y = math.floor(TOP - 0.10 * cell + 0.5)
-  sheet.w = math.floor(COLS * cell + 0.5)
-  sheet.h = math.floor(H - MARGIN + 0.5) - sheet.y
+  sheet.w = math.floor(cols * cell + 0.5)
+  local y1
+  if stage.free then
+    y1 = math.floor(view.h - MARGIN + 0.5)                       -- 画面の下端で切る
+  else
+    y1 = math.floor(TOP + 0.5 * cell + (rows - 1) * 0.87 * cell + 0.6 * cell + 0.5)
+  end
+  sheet.h = y1 - sheet.y
+  maxScroll = stage.free and 0 or math.max(0, y1 + MARGIN - view.h)
+  scrollY = clamp(scrollY, 0, maxScroll)
   local x0, y0 = sheet.x, sheet.y
-  local x1, y1 = x0 + sheet.w, y0 + sheet.h
+  local x1 = x0 + sheet.w
   for _, b in ipairs(bubbles) do
     -- シートの縁で切れている粒は半割。押されて凹むだけで、破裂しない
     b.cut = (b.x - b.rad < x0 - 0.5) or (b.x + b.rad > x1 + 0.5) or (b.y + b.rad > y1 + 0.5)
@@ -326,9 +172,9 @@ local function newSheet()
   bubbles = {}
   pending = {}
   for r = 1, rows do
-    local c0 = (r % 2 == 0) and 0 or 1              -- 偶数行は両端(c=0, c=COLS)に半割の粒が入る
-    for c = c0, COLS do
-      local hard = love.math.random() < HARD_RATIO
+    local c0 = (r % 2 == 0) and 0 or 1              -- 偶数行は両端(c=0, c=cols)に半割の粒が入る
+    for c = c0, stage.cols do
+      local hard = love.math.random() < stage.hardRatio
       local b = {
         c = c, r = r,
         press = 0,
@@ -341,7 +187,7 @@ local function newSheet()
         dwell = 0,                                 -- 今回の接触で押し続けた時間
         wobA = 0, wobT = 10,                       -- 離したときの揺れ
         popped = false, t = 0,
-        snd = love.math.random(NUM_VARIANTS),
+        snd = love.math.random(Sound.NUM_VARIANTS),
         sz = rand(0.97, 1.03),                     -- 大きさの個体差
         tint = rand(-0.03, 0.03),                  -- 色味の個体差
         hx = rand(-0.35, 0.35), hy = rand(-0.35, 0.35),  -- 破裂後の穴の位置
@@ -355,18 +201,21 @@ local function newSheet()
       bubbles[#bubbles + 1] = b
     end
   end
+  local k = stage.free and 1 or 3                  -- シートが長いほど筋やしわを増やす
   sheet.sheen = {}                                 -- フィルム面のうっすらした筋
-  for i = 1, 10 do
+  for i = 1, 10 * k do
     sheet.sheen[i] = { rand(0, 1), rand(0, 1), rand(0, 1), rand(0, 1) }
   end
   sheet.creases = {}                               -- 長くて柔らかいしわ(ビニールの折れ)
-  for i = 1, 5 do
+  for i = 1, 5 * k do
     local y1 = rand(0, 1)
-    sheet.creases[i] = { 0, y1, 1, y1 + rand(-0.25, 0.25), rand(0.05, 0.11) }
+    sheet.creases[i] = { 0, y1, 1, y1 + rand(-0.25, 0.25) / k, rand(0.05, 0.11) }
   end
   lastTarget = nil
   leftAt = -1
   elapsed, timing = 0, false
+  finished, finishInfo = false, nil
+  scrollY, edgeDir, sy0 = 0, 0, nil
   layout()
   popped, total = 0, 0                             -- 半割の粒は数えない
   for _, b in ipairs(bubbles) do
@@ -374,12 +223,13 @@ local function newSheet()
   end
 end
 
-local function hit(mx, my)
-  if mx < sheet.x or mx > sheet.x + sheet.w or my < sheet.y or my > sheet.y + sheet.h then
+-- (mx, wy): シート上の座標(スクロール分を足したもの)
+local function hit(mx, wy)
+  if mx < sheet.x or mx > sheet.x + sheet.w or wy < sheet.y or wy > sheet.y + sheet.h then
     return nil                                     -- 切り落とされた部分は触れない
   end
   for _, b in ipairs(bubbles) do
-    local dx, dy = mx - b.x, my - b.y
+    local dx, dy = mx - b.x, wy - b.y
     if dx * dx + dy * dy <= b.rad * b.rad then return b end
   end
 end
@@ -387,7 +237,37 @@ end
 local function pop(b)
   b.popped, b.t = true, 0
   popped = popped + 1
-  playPop(b)
+  Sound.playPop(b.snd)
+end
+
+---------------------------------------------------------------
+-- メニューとステージの出入り
+---------------------------------------------------------------
+local function menuCard(i)
+  return 40, 190 + (i - 1) * 128, view.w - 80, 108
+end
+
+local function menuHit(mx, my)
+  for i = 1, #STAGES do
+    local x, y, w, h = menuCard(i)
+    if mx >= x and mx <= x + w and my >= y and my <= y + h then return i end
+  end
+end
+
+local function enterStage(i)
+  stage = STAGES[i]
+  scene = "play"
+  updateView()
+  fingerPress = 0
+  newSheet()
+  love.mouse.setVisible(not useFinger())          -- 指のカーソルを使うステージでは本物のカーソルを隠す
+end
+
+local function exitToMenu()
+  scene = "menu"
+  love.mouse.setVisible(true)
+  pending = {}
+  updateView()
 end
 
 ---------------------------------------------------------------
@@ -398,62 +278,107 @@ function love.load()
   love.graphics.setBackgroundColor(0.86, 0.92, 0.96)
   hudFont = love.graphics.newFont(HUD_SIZE)
   msgFont = love.graphics.newFont(MSG_SIZE)
+  titleFont = love.graphics.newFont(TITLE_SIZE)
   love.math.setRandomSeed(os.time())
-  local wsum = 0
-  for _, k in ipairs(POP_ORDER) do wsum = wsum + POP_KINDS[k].w end
-  local function pickKind()                                 -- 重みに応じて種類を選ぶ
-    local r = love.math.random() * wsum
-    for _, k in ipairs(POP_ORDER) do
-      r = r - POP_KINDS[k].w
-      if r <= 0 then return k end
-    end
-    return POP_ORDER[1]
-  end
-  for i = 1, NUM_VARIANTS do
-    local kind = POP_ORDER[i] or pickKind()                 -- 最初の6個は全種類を必ず入れる
-    local K = POP_KINDS[kind]
-    variants[i] = makePop(rand(K.sizeMin, K.sizeMax), kind)
-  end
-  creak = makeCreak()
-  for i = 1, 3 do
-    stretchSrc[i] = makeStretch()
-    springSrc[i] = makeSpring()
-  end
-  newSheet()
+  Sound.init()
+  Records.load()
+  updateView()
 end
 
-function love.resize() newSheet() end   -- 画面サイズが変わると行数も変わるので作り直す
+function love.resize()
+  updateView()
+  if scene == "play" and stage.free then newSheet() end   -- 可変ステージは行数が変わるので作り直す
+end
 
 function love.mousepressed(x, y, button)
-  if popped == total then newSheet() return end       -- 全部潰したらリセット
-  local b = hit(x, y)
+  local mx, sy = (x - view.ox) / view.scale, (y - view.oy) / view.scale
+  if scene == "menu" then
+    if button == 1 then
+      local i = menuHit(mx, sy)
+      if i then enterStage(i) end
+    end
+    return
+  end
+  if button ~= 1 then return end
+  if finished then
+    if love.timer.getTime() - finishAt > FINISH_LOCK then newSheet() end   -- 全部潰したらクリックで再挑戦
+    return
+  end
+  if sy < HUD_H then return end
+  local b = hit(mx, sy + scrollY)
   if b and not b.popped then
     b.press = math.max(b.press, rand(0.25, 0.5))      -- 素早いタップ対応
     b.dwell = 0
     lastTarget = b
-    playCreak(b.cut and 0.3 or 1)
+    Sound.playCreak(b.cut and 0.3 or 1)
   end
 end
 
+-- 右ボタン(または中ボタン)を押したままドラッグでスクロール
+function love.mousemoved(x, y, dx, dy)
+  if scene == "play" and stage.scroll and (love.mouse.isDown(2) or love.mouse.isDown(3)) then
+    scrollBy(-dy / view.scale)
+  end
+end
+
+function love.wheelmoved(x, y)
+  if scene == "play" and stage.scroll then scrollBy(-y * SCROLL_WHEEL) end
+end
+
 function love.keypressed(key, scancode)
+  if scene == "menu" then
+    if key == "escape" then love.event.quit() end
+    local i = tonumber(key)
+    if i and STAGES[i] then enterStage(i) end
+    return
+  end
   if key == "r" or scancode == "r" then newSheet() end   -- キー配列に関係なく物理的なRキーでも反応
-  if key == "escape" then love.event.quit() end
+  if key == "escape" then exitToMenu() end
+  if stage.scroll then
+    if key == "home" then scrollY = 0 end
+    if key == "end" then scrollY = maxScroll end
+    if key == "pageup" then scrollBy(-view.h * 0.8) end
+    if key == "pagedown" then scrollBy(view.h * 0.8) end
+  end
 end
 
 function love.update(dt)
+  if scene ~= "play" then return end
   local now = love.timer.getTime()
-  local mx, my = love.mouse.getPosition()
+  local mx, sy = mousePos()
   local down = love.mouse.isDown(1)
+
+  -- スクロール: 矢印キー / W・S / 押したまま上下の端へ動かしている間
+  if stage.scroll then
+    if love.keyboard.isDown("up", "w") then scrollBy(-SCROLL_KEY * dt) end
+    if love.keyboard.isDown("down", "s") then scrollBy(SCROLL_KEY * dt) end
+    if down and not finished then
+      local dyv = sy - (sy0 or sy)
+      local inTop = sy < HUD_H + EDGE_ZONE
+      local inBot = sy > view.h - EDGE_ZONE
+      -- 端に向かって動かしたときだけ始まる(端の粒をゆっくり潰すときに勝手に動かないように)
+      if inTop and (dyv < -1 or edgeDir == -1) then edgeDir = -1
+      elseif inBot and (dyv > 1 or edgeDir == 1) then edgeDir = 1
+      else edgeDir = 0 end
+      if edgeDir ~= 0 then scrollBy(edgeDir * EDGE_SPEED * dt) end
+    else
+      edgeDir = 0
+    end
+  end
+  sy0 = sy
+  local wy = sy + scrollY                          -- シート上の座標
 
   -- マウス移動速度(平滑化)。なぞりの速さで粒に入る力を変えるために使う
   if down and mx0 then
-    local dx, dy = mx - mx0, my - my0
+    local dx, dy = mx - mx0, wy - my0
     local inst = math.sqrt(dx * dx + dy * dy) / math.max(dt, 1e-4)
     mspeed = mspeed + (inst - mspeed) * math.min(1, dt * 10)
   else
     mspeed = 0
   end
-  mx0, my0 = mx, my
+  mx0, my0 = mx, wy
+
+  fingerPress = fingerPress + ((down and 1 or 0) - fingerPress) * math.min(1, dt * 18)
 
   -- 遅らせて鳴らす音
   for i = #pending, 1, -1 do
@@ -466,9 +391,9 @@ function love.update(dt)
   end
 
   local target
-  if down then target = hit(mx, my) end
+  if down and sy >= HUD_H and not finished then target = hit(mx, wy) end
   if target then timing = true end                            -- 最初に粒に触れたら計測開始
-  if timing and popped < total then elapsed = elapsed + dt end -- 全部潰したら止まる
+  if timing and not finished then elapsed = elapsed + dt end  -- 全部潰したら止まる
 
   -- なぞって別の粒に入ったとき
   --  ・ゆっくりなぞるほど深く入り、速いほど浅く触れるだけ
@@ -490,7 +415,7 @@ function love.update(dt)
       end
       target.press = target.press + force
       target.dwell = 0
-      playCreak(target.cut and 0.3 or (0.5 + 0.5 * slow))
+      Sound.playCreak(target.cut and 0.3 or (0.5 + 0.5 * slow))
     end
     lastTarget = target
   end
@@ -498,7 +423,7 @@ function love.update(dt)
   for _, b in ipairs(bubbles) do
     if b.cut then                                      -- 半割の粒: 押されて凹むだけで破裂しない
       if b == target then
-        b.press = math.min(0.45, b.press + dt / PRESS_TIME * 0.6)
+        b.press = math.min(0.45, b.press + dt / stage.pressTime * 0.6)
       else
         b.press = math.max(0, b.press - dt / RELEASE_TIME)
       end
@@ -508,12 +433,12 @@ function love.update(dt)
         b.dwell = b.dwell + dt
         -- 押し込み速度は粒ごとに違い、しかも時間とともに滑らかに揺らぐ
         local wave = 0.55 + 0.9 * love.math.noise(b.seed, now * 3)
-        b.press = b.press + dt / PRESS_TIME * b.speed * wave
+        b.press = b.press + dt / stage.pressTime * b.speed * wave
         if b.press >= b.thresh then
           pop(b)
         elseif b.press / b.thresh > 0.7 and not b.stretched then
           b.stretched = true                               -- 素材が伸び切る手前
-          if b.hard or love.math.random() < 0.35 then playStretch(b.hard) end
+          if b.hard or love.math.random() < 0.35 then Sound.playStretch(b.hard) end
         end
       else
         if b.held then                                     -- 指を離した瞬間
@@ -523,7 +448,7 @@ function love.update(dt)
             -- 空気が戻る「ポコッ」は少し遅れて鳴る。揺れも同じタイミングで始める
             later(rand(SPRING_DELAY_MIN, SPRING_DELAY_MAX), function()
               if not b.popped then
-                playSpring(p)
+                Sound.playSpring(p)
                 b.wobA, b.wobT = p, 0
               end
             end)
@@ -537,51 +462,22 @@ function love.update(dt)
       b.t = b.t + dt
     end
   end
+
+  -- 全部潰したら記録する(記録のあるステージだけ)
+  if not finished and total > 0 and popped >= total then
+    finished = true
+    finishAt = now
+    if stage.record then
+      local prev = Records.best(stage.id)
+      local rank = Records.add(stage.id, elapsed, stage.record.n)
+      finishInfo = { prev = prev, rank = rank }
+    end
+  end
 end
 
 ---------------------------------------------------------------
--- 描画
+-- 描画: 粒
 ---------------------------------------------------------------
-local function drawSheet()
-  love.graphics.setColor(0, 0.1, 0.2, 0.10)                      -- シートの影(厚みの表現)
-  love.graphics.rectangle("fill", sheet.x + 2, sheet.y + 3, sheet.w, sheet.h)
-  love.graphics.setColor(1, 1, 1, 0.38)                          -- 平らなフィルム面
-  love.graphics.rectangle("fill", sheet.x, sheet.y, sheet.w, sheet.h)
-end
-
--- 粒の上に重ねるフィルムの反射。マウスの位置で光の帯が動く
-local function drawFilm()
-  love.graphics.setScissor(sheet.x, sheet.y, sheet.w, sheet.h)
-
-  local W = love.graphics.getWidth()
-  local mxr = math.max(0, math.min(1, love.mouse.getX() / W))
-  local skew = sheet.h * 0.35
-  local bw = sheet.w * 0.16
-  local gx = sheet.x + sheet.w * (0.1 + 0.9 * mxr)
-  love.graphics.setColor(1, 1, 1, 0.10)                          -- 太い光の帯
-  love.graphics.polygon("fill", gx, sheet.y, gx + bw, sheet.y,
-                        gx + bw - skew, sheet.y + sheet.h, gx - skew, sheet.y + sheet.h)
-  local gx2 = gx + bw * 1.6
-  love.graphics.setColor(1, 1, 1, 0.06)                          -- 細い光の帯
-  love.graphics.polygon("fill", gx2, sheet.y, gx2 + bw * 0.3, sheet.y,
-                        gx2 + bw * 0.3 - skew, sheet.y + sheet.h, gx2 - skew, sheet.y + sheet.h)
-
-  love.graphics.setLineWidth(1)
-  love.graphics.setColor(1, 1, 1, 0.14)                          -- うっすらした光の筋
-  for _, s in ipairs(sheet.sheen) do
-    love.graphics.line(sheet.x + s[1] * sheet.w, sheet.y + s[2] * sheet.h,
-                       sheet.x + s[3] * sheet.w, sheet.y + s[4] * sheet.h)
-  end
-  love.graphics.setLineWidth(3)                                  -- ビニールの折れ(長く柔らかい)
-  for _, c in ipairs(sheet.creases) do
-    love.graphics.setColor(1, 1, 1, c[5])
-    love.graphics.line(sheet.x + c[1] * sheet.w, sheet.y + c[2] * sheet.h,
-                       sheet.x + c[3] * sheet.w, sheet.y + c[4] * sheet.h)
-  end
-
-  love.graphics.setScissor()
-end
-
 local function drawIntact(b)
   local p = math.min(1, b.press / b.thresh)       -- 破裂までの張り具合 0〜1
   local hk = b.hard and 1.6 or 1.0                -- 伸びる粒ほど大きく変形する
@@ -666,6 +562,59 @@ local function drawPopped(b)
   end
 end
 
+---------------------------------------------------------------
+-- 描画: シート(スクロールする層)
+---------------------------------------------------------------
+-- シートの矩形と、上部の表示エリアより下の範囲が重なる部分にシザーを設定する
+local function clipSheet()
+  local x0 = math.max(sheet.x, 0)
+  local y0 = math.max(sheet.y - scrollY, HUD_H)
+  local x1 = math.min(sheet.x + sheet.w, view.w)
+  local y1 = math.min(sheet.y + sheet.h - scrollY, view.h)
+  if x1 <= x0 or y1 <= y0 then return false end
+  setScissor(x0, y0, x1 - x0, y1 - y0)
+  return true
+end
+
+local function drawSheet()
+  love.graphics.setColor(0, 0.1, 0.2, 0.10)                      -- シートの影(厚みの表現)
+  love.graphics.rectangle("fill", sheet.x + 2, sheet.y + 3, sheet.w, sheet.h)
+  love.graphics.setColor(1, 1, 1, 0.38)                          -- 平らなフィルム面
+  love.graphics.rectangle("fill", sheet.x, sheet.y, sheet.w, sheet.h)
+end
+
+-- 粒の上に重ねるフィルムの反射。マウスの位置で光の帯が動く(見えている範囲に合わせて動く)
+local function drawFilm()
+  if not clipSheet() then return end
+
+  local mx = mousePos()
+  local mxr = clamp(mx / view.w, 0, 1)
+  local yv0 = math.max(sheet.y, scrollY)
+  local yv1 = math.min(sheet.y + sheet.h, scrollY + view.h)
+  local skew = (yv1 - yv0) * 0.35
+  local bw = sheet.w * 0.16
+  local gx = sheet.x + sheet.w * (0.1 + 0.9 * mxr)
+  love.graphics.setColor(1, 1, 1, 0.10)                          -- 太い光の帯
+  love.graphics.polygon("fill", gx, yv0, gx + bw, yv0, gx + bw - skew, yv1, gx - skew, yv1)
+  local gx2 = gx + bw * 1.6
+  love.graphics.setColor(1, 1, 1, 0.06)                          -- 細い光の帯
+  love.graphics.polygon("fill", gx2, yv0, gx2 + bw * 0.3, yv0,
+                        gx2 + bw * 0.3 - skew, yv1, gx2 - skew, yv1)
+
+  love.graphics.setLineWidth(1)
+  love.graphics.setColor(1, 1, 1, 0.14)                          -- うっすらした光の筋
+  for _, s in ipairs(sheet.sheen) do
+    love.graphics.line(sheet.x + s[1] * sheet.w, sheet.y + s[2] * sheet.h,
+                       sheet.x + s[3] * sheet.w, sheet.y + s[4] * sheet.h)
+  end
+  love.graphics.setLineWidth(3)                                  -- ビニールの折れ(長く柔らかい)
+  for _, c in ipairs(sheet.creases) do
+    love.graphics.setColor(1, 1, 1, c[5])
+    love.graphics.line(sheet.x + c[1] * sheet.w, sheet.y + c[2] * sheet.h,
+                       sheet.x + c[3] * sheet.w, sheet.y + c[4] * sheet.h)
+  end
+end
+
 -- 縁に沿って、手ぶれのある折れ線を引く(horizontal: 水平の縁か, off: 外側へのずらし量)
 local function wobLine(x0, y0, x1, y1, wob, horizontal, off)
   local n = #wob
@@ -703,35 +652,144 @@ local function drawCutEdges()
   wobLine(x1, y0, x1, y1, wb.right, false, 0)
 end
 
--- 経過時間を「分:秒.1/100秒」にする
-local function fmtTime(sec)
-  local cs = math.floor(sec * 100)                 -- 1/100秒単位の整数
-  return string.format("%d:%02d.%02d", math.floor(cs / 6000), math.floor(cs / 100) % 60, cs % 100)
+---------------------------------------------------------------
+-- 描画: 画面全体
+---------------------------------------------------------------
+-- 右端のスクロールバー。潰していない粒の位置が青い印で見える(最後の1粒探しに便利)
+local function drawScrollbar()
+  if maxScroll <= 0 then return end
+  local x = view.w - 10
+  local y0, h = HUD_H + 4, view.h - HUD_H - 8
+  local worldH = maxScroll + view.h
+  love.graphics.setColor(0.2, 0.3, 0.4, 0.12)
+  love.graphics.rectangle("fill", x, y0, 6, h, 3, 3)
+  love.graphics.setColor(0.25, 0.55, 0.9, 0.6)
+  for _, b in ipairs(bubbles) do
+    if not b.popped and not b.cut then
+      love.graphics.rectangle("fill", x, y0 + h * b.y / worldH, 6, 1.5)
+    end
+  end
+  local th = math.max(14, h * view.h / worldH)
+  local ty = y0 + h * scrollY / worldH
+  love.graphics.setColor(0.2, 0.3, 0.4, 0.40)
+  love.graphics.setLineWidth(1.5)
+  love.graphics.rectangle("line", x - 1.5, ty, 9, th, 4, 4)
+end
+
+local function drawFinishPanel()
+  love.graphics.setFont(msgFont)
+  local lines = { "All popped!  " .. fmtTime(elapsed) }
+  if stage.record then
+    local best = Records.best(stage.id)
+    if finishInfo and finishInfo.rank == 1 then
+      lines[#lines + 1] = finishInfo.prev and ("NEW RECORD!  (prev " .. fmtTime(finishInfo.prev) .. ")")
+                          or "NEW RECORD!"
+    else
+      lines[#lines + 1] = "BEST  " .. (best and fmtTime(best) or "--")
+    end
+  end
+  lines[#lines + 1] = "Click: retry   Esc: menu"
+  local lw = 0
+  for _, l in ipairs(lines) do lw = math.max(lw, msgFont:getWidth(l)) end
+  local lh = msgFont:getHeight()
+  local bw, bh = lw + 48, lh * #lines + 32
+  local vy0 = HUD_H
+  local py = vy0 + (view.h - vy0 - bh) / 2
+  love.graphics.setColor(1, 1, 1, 0.85)
+  love.graphics.rectangle("fill", (view.w - bw) / 2, py, bw, bh, 14, 14)
+  love.graphics.setColor(0.5, 0.75, 0.95, 0.9)
+  love.graphics.setLineWidth(1.5)
+  love.graphics.rectangle("line", (view.w - bw) / 2, py, bw, bh, 14, 14)
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.printf(table.concat(lines, "\n"), 0, py + 16, view.w, "center")
+end
+
+local function drawPlay()
+  -- シート(スクロールする層)
+  setScissor(0, HUD_H, view.w, view.h - HUD_H)
+  love.graphics.push()
+  love.graphics.translate(0, -scrollY)
+  drawSheet()
+  if clipSheet() then
+    for _, b in ipairs(bubbles) do
+      if b.y + b.rad > scrollY and b.y - b.rad < scrollY + view.h then   -- 見えている粒だけ描く
+        if b.popped then drawPopped(b) else drawIntact(b) end
+      end
+    end
+  end
+  drawFilm()
+  setScissor(0, HUD_H, view.w, view.h - HUD_H)
+  drawCutEdges()
+  love.graphics.pop()
+  love.graphics.setScissor()
+
+  if scrollY > 1 then                                            -- 上部の表示エリアの下に薄い影
+    for i = 0, 7 do
+      love.graphics.setColor(0.1, 0.2, 0.3, 0.10 * (1 - i / 8))
+      love.graphics.rectangle("fill", 0, HUD_H + i, view.w, 1)
+    end
+  end
+
+  -- 上部の表示: 左=潰した数 / 中央=経過時間 / 右=リセットの案内(記録のあるステージは最高記録)
+  love.graphics.setFont(hudFont)
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.print(string.format("%d / %d", popped, total), 16, 18)
+  love.graphics.printf(fmtTime(elapsed), 0, 18, view.w, "center")
+  if stage.record then
+    local best = Records.best(stage.id)
+    love.graphics.printf("BEST " .. (best and fmtTime(best) or "--"), 0, 18, view.w - 16, "right")
+  else
+    love.graphics.printf("[R] reset", 0, 18, view.w - 16, "right")
+  end
+
+  drawScrollbar()
+  if finished then drawFinishPanel() end
+
+  if useFinger() then                                            -- 指のカーソル(いちばん手前)
+    local mx, sy = mousePos()
+    Finger.draw(mx, sy, fingerPress)
+  end
+end
+
+local function drawMenu()
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.setFont(titleFont)
+  love.graphics.printf("PUCHIPUCHI", 0, 60, view.w, "center")
+  love.graphics.setFont(hudFont)
+  love.graphics.setColor(0.35, 0.45, 0.55)
+  love.graphics.printf("Level 1", 0, 130, view.w, "center")
+
+  local mx, my = mousePos()
+  for i, s in ipairs(STAGES) do
+    local x, y, w, h = menuCard(i)
+    local over = mx >= x and mx <= x + w and my >= y and my <= y + h
+    love.graphics.setColor(1, 1, 1, over and 0.80 or 0.50)
+    love.graphics.rectangle("fill", x, y, w, h, 14, 14)
+    love.graphics.setColor(0.5, 0.75, 0.95, 0.9)
+    love.graphics.setLineWidth(1.5)
+    love.graphics.rectangle("line", x, y, w, h, 14, 14)
+    love.graphics.setColor(0.2, 0.3, 0.4)
+    love.graphics.setFont(msgFont)
+    love.graphics.print(i .. "   " .. s.title, x + 20, y + 16)
+    love.graphics.setFont(hudFont)
+    love.graphics.setColor(0.35, 0.45, 0.55)
+    love.graphics.print(s.sub, x + 20, y + 62)
+    if s.record then
+      local best = Records.best(s.id)
+      love.graphics.printf("BEST " .. (best and fmtTime(best) or "--"), x, y + 16, w - 20, "right")
+    end
+  end
+
+  love.graphics.setFont(hudFont)
+  love.graphics.setColor(0.45, 0.55, 0.65)
+  love.graphics.printf("Lv1-3 and more: coming soon", 0, view.h - 110, view.w, "center")
+  love.graphics.printf("Click or press 1-" .. #STAGES .. "     Esc: quit", 0, view.h - 70, view.w, "center")
 end
 
 function love.draw()
-  drawSheet()
-  love.graphics.setScissor(sheet.x, sheet.y, sheet.w, sheet.h)   -- 縁の外にはみ出した粒を切り落とす
-  for _, b in ipairs(bubbles) do
-    if b.popped then drawPopped(b) else drawIntact(b) end
-  end
-  love.graphics.setScissor()
-  drawFilm()
-  drawCutEdges()
-  local W, H = love.graphics.getDimensions()
-  love.graphics.setFont(hudFont)
-  love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.print(string.format("%d / %d", popped, total), 16, 18)          -- 左: 潰した数
-  love.graphics.printf(fmtTime(elapsed), 0, 18, W, "center")                    -- 中央: 経過時間
-  love.graphics.printf("[R] reset", 0, 18, W - 16, "right")                     -- 右: リセット
-  if popped == total then                                       -- 全部潰したら画面中央にメッセージ
-    love.graphics.setFont(msgFont)
-    local line1 = "All popped!  " .. fmtTime(elapsed)
-    local bw = math.max(msgFont:getWidth(line1), msgFont:getWidth("Tap to start again")) + 48
-    local bh = msgFont:getHeight() * 2 + 32
-    love.graphics.setColor(1, 1, 1, 0.80)
-    love.graphics.rectangle("fill", (W - bw) / 2, (H - bh) / 2, bw, bh, 14, 14)
-    love.graphics.setColor(0.2, 0.3, 0.4)
-    love.graphics.printf(line1 .. "\nTap to start again", 0, (H - bh) / 2 + 16, W, "center")
-  end
+  love.graphics.push()
+  love.graphics.translate(view.ox, view.oy)
+  love.graphics.scale(view.scale)
+  if scene == "menu" then drawMenu() else drawPlay() end
+  love.graphics.pop()
 end
