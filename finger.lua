@@ -52,19 +52,20 @@ local function build()
   }
 end
 
--- x, y: 指先の位置 / press: 0(離している)〜1(押している)
-function Finger.draw(x, y, press)
+-- x, y: 指先の位置 / press: 0(離している)〜1(押している) / scale: 大きさの倍率(省略時は 1)
+function Finger.draw(x, y, press, scale)
+  local k = scale or 1
   if not parts then build() end
   local c = FW / 2
   local sc = 1 - 0.04 * press
-  local dy = 3 * press
+  local dy = 3 * press * k
 
   -- 影(押すほど指に近づいて濃くなる)
   local so = 18 - 11 * press
   love.graphics.push()
-  love.graphics.translate(x + so * 0.6, y + so)
+  love.graphics.translate(x + so * 0.6 * k, y + so * k)
   love.graphics.rotate(ANGLE)
-  love.graphics.scale(sc, sc)
+  love.graphics.scale(sc * k, sc * k)
   love.graphics.setColor(0, 0.08, 0.16, 0.10 + 0.10 * press)
   love.graphics.circle("fill", c, 0, c)
   love.graphics.setColor(1, 1, 1, 0.5 + 0.5 * press)
@@ -75,7 +76,7 @@ function Finger.draw(x, y, press)
   love.graphics.push()
   love.graphics.translate(x, y + dy)
   love.graphics.rotate(ANGLE)
-  love.graphics.scale(sc, sc)
+  love.graphics.scale(sc * k, sc * k)
 
   love.graphics.setColor(0.96, 0.80, 0.68)                        -- 肌の色(指先の丸み)
   love.graphics.circle("fill", c, 0, c)

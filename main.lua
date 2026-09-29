@@ -1,6 +1,7 @@
 -- Puchipuchi v1.0: bubble wrap popping game (LÖVE 11.x)
 -- Lv1-1 Training : ウィンドウの大きさに合わせて行数が変わる(これまでのステージ)
 -- Lv1-2 Big Sheet: 画面サイズ固定 / 約300粒 / スクロール / 指のカーソル / 自己ベストを記録
+-- Lv1-3 Large / Small: 大粒約150 / 小粒約500 / 上位3位の記録とイニシャル入力
 --
 -- ファイル構成
 --   main.lua     ゲーム本体(このファイル)
@@ -12,6 +13,11 @@
 -- 履歴
 --   v0.2〜v0.10: 素材感・音・手応え・半割の粒・時間表示など(ステージ1)
 --   v1.0: ステージ選択 / スクロール / 指のカーソル / 記録 / ファイル分割
+--   v1.1: 指のカーソルを親指の形に
+--   v1.2: Lv1-3 大粒・小粒 / 上位3位とイニシャル入力 / 記録の一覧画面(メニューで T) / ステージごとの音の高さ
+--   v1.3: 命中判定の広さを3段階に(Blue=円全体/Yellow=大きめの中心/Pink=小さい中心)。
+--         メニューで選び、どのステージにも適用。記録には使った色も残す(ランキングは今まで通り1本)。
+--         色スウォッチの下に難易度の目安(EASY/HARD/LUNATIC)を表示
 
 local Sound = require("sound")
 local Records = require("records")
@@ -59,8 +65,18 @@ local sy0, edgeDir = nil, 0                   -- 端への自動スクロール�
 local leftAt, leftP, leftDwell = -1, 0, 0     -- 直前に離れた粒の記録(勢いの持ち越し用)
 local elapsed, timing = 0, false              -- 経過時間(秒)と計測中かどうか
 local finished, finishAt, finishInfo = false, 0, nil
+local entering, initials, entryRank = false, "", nil   -- イニシャル入力中か / 入力した文字 / 順位
+local lastInitials = ""                                 -- 直前に入力したイニシャル(次の入力の初期値)
 local fingerPress = 0                         -- 指カーソルの押し込み量(0〜1)
-local hudFont, msgFont, titleFont
+local hudFont, msgFont, titleFont, tinyFont
+
+-- 命中判定の広さ(粒の半径に対する割合)。狭いほど、粒の中心付近に正確に触れないと反応しない
+local COLOR_MODES = { "blue", "yellow", "pink" }
+local COLOR_FACTOR = { blue = 1.00, yellow = 0.55, pink = 0.30 }
+local COLOR_LABEL  = { blue = "BLUE", yellow = "YELLOW", pink = "PINK" }
+local COLOR_DIFF   = { blue = "EASY", yellow = "HARD", pink = "LUNATIC" }   -- 難易度の目安
+local COLOR_RGB    = { blue = { 0.35, 0.60, 0.95 }, yellow = { 0.85, 0.68, 0.15 }, pink = { 0.90, 0.45, 0.65 } }
+local colorMode = "blue"                      -- メニューで選んだ命中判定の広さ(全ステージ共通)
 
 local function rand(a, b) return a + (b - a) * love.math.random() end
 local function later(delay, fn) pending[#pending + 1] = { t = delay, fn = fn } end
@@ -215,6 +231,7 @@ local function newSheet()
   leftAt = -1
   elapsed, timing = 0, false
   finished, finishInfo = false, nil
+  entering, initials, entryRank = false, "", nil
   scrollY, edgeDir, sy0 = 0, 0, nil
   layout()
   popped, total = 0, 0                             -- 半割の粒は数えない
@@ -228,9 +245,10 @@ local function hit(mx, wy)
   if mx < sheet.x or mx > sheet.x + sheet.w or wy < sheet.y or wy > sheet.y + sheet.h then
     return nil                                     -- 切り落とされた部分は触れない
   end
+  local r2 = (COLOR_FACTOR[colorMode] or 1) ^ 2
   for _, b in ipairs(bubbles) do
     local dx, dy = mx - b.x, wy - b.y
-    if dx * dx + dy * dy <= b.rad * b.rad then return b end
+    if dx * dx + dy * dy <= b.rad * b.rad * r2 then return b end
   end
 end
 
@@ -244,7 +262,23 @@ end
 -- メニューとステージの出入り
 ---------------------------------------------------------------
 local function menuCard(i)
-  return 40, 190 + (i - 1) * 128, view.w - 80, 108
+  return 40, 258 + (i - 1) * 110, view.w - 80, 92
+end
+
+-- メニュー上部の色スウォッチ(命中判定の広さの選択)。3つを横に並べる
+local function colorSwatch(i)
+  local r = 18
+  local gap = 84
+  local cx = view.w / 2 + (i - 2) * gap
+  return cx, 204, r
+end
+
+local function colorSwatchHit(mx, my)
+  for i, name in ipairs(COLOR_MODES) do
+    local cx, cy, r = colorSwatch(i)
+    local dx, dy = mx - cx, my - cy
+    if dx * dx + dy * dy <= r * r then return name end
+  end
 end
 
 local function menuHit(mx, my)
@@ -259,8 +293,14 @@ local function enterStage(i)
   scene = "play"
   updateView()
   fingerPress = 0
+  Sound.setPitchScale(stage.soundPitch or 1)     -- 大粒は低く長く、小粒は高く短く
   newSheet()
   love.mouse.setVisible(not useFinger())          -- 指のカーソルを使うステージでは本物のカーソルを隠す
+end
+
+-- ランキングは1本のまま(ステージ単位)。どの色で出したかは記録ごとに残すだけにしている
+local function recBest()
+  return Records.best(stage.id)
 end
 
 local function exitToMenu()
@@ -268,6 +308,14 @@ local function exitToMenu()
   love.mouse.setVisible(true)
   pending = {}
   updateView()
+end
+
+-- イニシャルを確定して記録する
+local function confirmEntry()
+  local rank = Records.add(stage.id, elapsed, stage.record.n, initials, colorMode)
+  lastInitials = initials
+  entering = false
+  finishInfo = { rank = rank }
 end
 
 ---------------------------------------------------------------
@@ -279,6 +327,7 @@ function love.load()
   hudFont = love.graphics.newFont(HUD_SIZE)
   msgFont = love.graphics.newFont(MSG_SIZE)
   titleFont = love.graphics.newFont(TITLE_SIZE)
+  tinyFont = love.graphics.newFont(13)
   love.math.setRandomSeed(os.time())
   Sound.init()
   Records.load()
@@ -292,14 +341,21 @@ end
 
 function love.mousepressed(x, y, button)
   local mx, sy = (x - view.ox) / view.scale, (y - view.oy) / view.scale
+  if scene == "records" then                         -- 記録の画面はクリックで戻る
+    scene = "menu"
+    return
+  end
   if scene == "menu" then
     if button == 1 then
+      local c = colorSwatchHit(mx, sy)
+      if c then colorMode = c return end
       local i = menuHit(mx, sy)
       if i then enterStage(i) end
     end
     return
   end
   if button ~= 1 then return end
+  if entering then return end                          -- イニシャル入力中はキーボードで入力する
   if finished then
     if love.timer.getTime() - finishAt > FINISH_LOCK then newSheet() end   -- 全部潰したらクリックで再挑戦
     return
@@ -326,10 +382,31 @@ function love.wheelmoved(x, y)
 end
 
 function love.keypressed(key, scancode)
+  if scene == "records" then
+    if key == "escape" or key == "t" or key == "return" then scene = "menu" end
+    return
+  end
   if scene == "menu" then
     if key == "escape" then love.event.quit() end
+    if key == "t" then scene = "records" end
+    if key == "b" then colorMode = "blue" end
+    if key == "y" then colorMode = "yellow" end
+    if key == "p" then colorMode = "pink" end
     local i = tonumber(key)
     if i and STAGES[i] then enterStage(i) end
+    return
+  end
+  if entering then                                        -- イニシャル入力中(Rなどの文字はここで入力になる)
+    if key == "backspace" then
+      initials = initials:sub(1, -2)
+    elseif key == "return" or key == "kpenter" then
+      if #initials >= 1 then confirmEntry() end
+    elseif key == "escape" then
+      entering = false                                    -- 入力せず、記録も残さない
+      finishInfo = { rank = nil }
+    elseif #key == 1 and key:match("^%w$") and #initials < 3 then
+      initials = initials .. key:upper()
+    end
     return
   end
   if key == "r" or scancode == "r" then newSheet() end   -- キー配列に関係なく物理的なRキーでも反応
@@ -467,10 +544,21 @@ function love.update(dt)
   if not finished and total > 0 and popped >= total then
     finished = true
     finishAt = now
-    if stage.record then
-      local prev = Records.best(stage.id)
-      local rank = Records.add(stage.id, elapsed, stage.record.n)
-      finishInfo = { prev = prev, rank = rank }
+    local rec = stage.record
+    if rec then
+      if rec.initials then
+        -- 上位に入ったら、イニシャルを入力してから記録する
+        entryRank = Records.qualifies(stage.id, elapsed, rec.n)
+        if entryRank then
+          entering, initials = true, lastInitials
+        else
+          finishInfo = { rank = nil }
+        end
+      else
+        local prev = Records.best(stage.id)
+        local rank = Records.add(stage.id, elapsed, rec.n, nil, colorMode)
+        finishInfo = { prev = prev, rank = rank }
+      end
     end
   end
 end
@@ -530,6 +618,13 @@ local function drawIntact(b)
   end
 
   love.graphics.pop()
+
+  if COLOR_FACTOR[colorMode] < 1 then                           -- 触れないと反応しない範囲の目印
+    local rgb = COLOR_RGB[colorMode]
+    love.graphics.setColor(rgb[1], rgb[2], rgb[3], 0.55)
+    love.graphics.setLineWidth(1.5)
+    love.graphics.circle("line", b.x, b.y, r * COLOR_FACTOR[colorMode])
+  end
 end
 
 local function drawPopped(b)
@@ -676,32 +771,111 @@ local function drawScrollbar()
   love.graphics.rectangle("line", x - 1.5, ty, 9, th, 4, 4)
 end
 
-local function drawFinishPanel()
-  love.graphics.setFont(msgFont)
-  local lines = { "All popped!  " .. fmtTime(elapsed) }
-  if stage.record then
-    local best = Records.best(stage.id)
-    if finishInfo and finishInfo.rank == 1 then
-      lines[#lines + 1] = finishInfo.prev and ("NEW RECORD!  (prev " .. fmtTime(finishInfo.prev) .. ")")
-                          or "NEW RECORD!"
-    else
-      lines[#lines + 1] = "BEST  " .. (best and fmtTime(best) or "--")
-    end
-  end
-  lines[#lines + 1] = "Click: retry   Esc: menu"
-  local lw = 0
-  for _, l in ipairs(lines) do lw = math.max(lw, msgFont:getWidth(l)) end
-  local lh = msgFont:getHeight()
-  local bw, bh = lw + 48, lh * #lines + 32
-  local vy0 = HUD_H
-  local py = vy0 + (view.h - vy0 - bh) / 2
+local function drawPanelFrame(px, py, bw, bh)
   love.graphics.setColor(1, 1, 1, 0.85)
-  love.graphics.rectangle("fill", (view.w - bw) / 2, py, bw, bh, 14, 14)
+  love.graphics.rectangle("fill", px, py, bw, bh, 14, 14)
   love.graphics.setColor(0.5, 0.75, 0.95, 0.9)
   love.graphics.setLineWidth(1.5)
-  love.graphics.rectangle("line", (view.w - bw) / 2, py, bw, bh, 14, 14)
+  love.graphics.rectangle("line", px, py, bw, bh, 14, 14)
+end
+
+local function drawFinishPanel()
+  local rec = stage.record
+  local lh = msgFont:getHeight()
+  local items = { { text = "All popped!  " .. fmtTime(elapsed) } }
+  if rec and rec.n == 1 then                                    -- 最高記録だけ残すステージ
+    local best = Records.best(stage.id)
+    local text
+    if finishInfo and finishInfo.rank == 1 then
+      text = finishInfo.prev and ("NEW RECORD!  (prev " .. fmtTime(finishInfo.prev) .. ")") or "NEW RECORD!"
+    else
+      text = "BEST  " .. (best and fmtTime(best) or "--")
+    end
+    items[#items + 1] = { text = text }
+  elseif rec then                                               -- 上位を残すステージ: 順位表
+    local top = Records.top(stage.id)
+    for i = 1, rec.n do
+      local r = top[i]
+      items[#items + 1] = {
+        row = true, i = i,
+        ini = (r and r.initials ~= "") and r.initials or "---",
+        time = r and fmtTime(r.time) or "--",
+        col = r and r.color ~= "" and r.color or nil,
+        hl = finishInfo ~= nil and finishInfo.rank == i,        -- 今回の記録を目立たせる
+      }
+    end
+  end
+  items[#items + 1] = { text = "Click: retry   Esc: menu" }
+
+  love.graphics.setFont(msgFont)
+  local lw = 340
+  for _, it in ipairs(items) do
+    if it.text then lw = math.max(lw, msgFont:getWidth(it.text)) end
+  end
+  local bw, bh = lw + 48, lh * #items + 32
+  local px = (view.w - bw) / 2
+  local py = HUD_H + (view.h - HUD_H - bh) / 2
+  drawPanelFrame(px, py, bw, bh)
+  local y = py + 16
+  for _, it in ipairs(items) do
+    if it.row then
+      if it.hl then
+        love.graphics.setColor(0.5, 0.75, 0.95, 0.35)
+        love.graphics.rectangle("fill", px + 16, y, bw - 32, lh, 6, 6)
+      end
+      love.graphics.setColor(0.2, 0.3, 0.4)
+      love.graphics.print(it.i .. ".", px + 28, y)
+      love.graphics.print(it.ini, px + 84, y)
+      if it.col then
+        local rgb = COLOR_RGB[it.col]
+        love.graphics.setColor(rgb[1], rgb[2], rgb[3], 1)
+        love.graphics.circle("fill", px + 152, y + lh * 0.5, 6)
+      end
+      love.graphics.setColor(0.2, 0.3, 0.4)
+      love.graphics.printf(it.time, px, y, bw - 28, "right")
+    else
+      love.graphics.setColor(0.2, 0.3, 0.4)
+      love.graphics.printf(it.text, px, y, bw, "center")
+    end
+    y = y + lh
+  end
+end
+
+-- イニシャル入力のパネル(上位に入ったとき)
+local function drawEntryPanel()
+  local lh = msgFont:getHeight()
+  local th = titleFont:getHeight()
+  local bw = 380
+  local bh = lh * 2 + th + hudFont:getHeight() + 64
+  local px = (view.w - bw) / 2
+  local py = HUD_H + (view.h - HUD_H - bh) / 2
+  drawPanelFrame(px, py, bw, bh)
+
+  love.graphics.setFont(msgFont)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.printf(table.concat(lines, "\n"), 0, py + 16, view.w, "center")
+  love.graphics.printf("NEW RANK #" .. tostring(entryRank) .. "!", px, py + 16, bw, "center")
+  love.graphics.printf(fmtTime(elapsed), px, py + 16 + lh, bw, "center")
+
+  love.graphics.setFont(titleFont)
+  local slotW = 56
+  local x0 = px + (bw - slotW * 3) / 2
+  local sy = py + 24 + lh * 2
+  local blink = math.floor(love.timer.getTime() * 2) % 2 == 0
+  for i = 1, 3 do
+    local sx = x0 + (i - 1) * slotW
+    local ch = initials:sub(i, i)
+    if ch ~= "" then
+      love.graphics.setColor(0.2, 0.3, 0.4)
+      love.graphics.printf(ch, sx, sy, slotW, "center")
+    end
+    local active = (i == #initials + 1) and blink               -- 次に入力する位置の下線が点滅する
+    love.graphics.setColor(0.35, 0.6, 0.9, active and 1 or 0.45)
+    love.graphics.rectangle("fill", sx + 8, sy + th - 2, slotW - 16, 3)
+  end
+
+  love.graphics.setFont(hudFont)
+  love.graphics.setColor(0.35, 0.45, 0.55)
+  love.graphics.printf("Type letters   Enter: OK   Esc: skip", px, py + bh - hudFont:getHeight() - 14, bw, "center")
 end
 
 local function drawPlay()
@@ -730,10 +904,13 @@ local function drawPlay()
     end
   end
 
-  -- 上部の表示: 左=潰した数 / 中央=経過時間 / 右=リセットの案内(記録のあるステージは最高記録)
+  -- 上部の表示: 左=色ドット+潰した数 / 中央=経過時間 / 右=リセットの案内(記録のあるステージは最高記録)
   love.graphics.setFont(hudFont)
+  local crgb = COLOR_RGB[colorMode]
+  love.graphics.setColor(crgb[1], crgb[2], crgb[3], 1)
+  love.graphics.circle("fill", 22, 27, 6)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.print(string.format("%d / %d", popped, total), 16, 18)
+  love.graphics.print(string.format("%d / %d", popped, total), 36, 18)
   love.graphics.printf(fmtTime(elapsed), 0, 18, view.w, "center")
   if stage.record then
     local best = Records.best(stage.id)
@@ -743,11 +920,11 @@ local function drawPlay()
   end
 
   drawScrollbar()
-  if finished then drawFinishPanel() end
+  if entering then drawEntryPanel() elseif finished then drawFinishPanel() end
 
   if useFinger() then                                            -- 指のカーソル(いちばん手前)
     local mx, sy = mousePos()
-    Finger.draw(mx, sy, fingerPress)
+    Finger.draw(mx, sy, fingerPress, stage.fingerScale)
   end
 end
 
@@ -757,7 +934,23 @@ local function drawMenu()
   love.graphics.printf("PUCHIPUCHI", 0, 60, view.w, "center")
   love.graphics.setFont(hudFont)
   love.graphics.setColor(0.35, 0.45, 0.55)
-  love.graphics.printf("Level 1", 0, 130, view.w, "center")
+  love.graphics.printf("Level 1", 0, 118, view.w, "center")
+  love.graphics.printf("Hit area: " .. COLOR_LABEL[colorMode] .. "  (" .. COLOR_DIFF[colorMode] .. ")",
+                       0, 142, view.w, "center")
+
+  for i, name in ipairs(COLOR_MODES) do                          -- 命中判定の広さの選択
+    local cx, cy, r = colorSwatch(i)
+    local rgb = COLOR_RGB[name]
+    love.graphics.setColor(rgb[1], rgb[2], rgb[3], 1)
+    love.graphics.circle("fill", cx, cy, r)
+    love.graphics.setColor(0.2, 0.3, 0.4, name == colorMode and 0.9 or 0.25)
+    love.graphics.setLineWidth(name == colorMode and 3 or 1.5)
+    love.graphics.circle("line", cx, cy, r + 4)
+    love.graphics.setFont(tinyFont)                              -- 丸の下に難易度の目安を表示
+    love.graphics.setColor(0.35, 0.45, 0.55, name == colorMode and 1 or 0.55)
+    love.graphics.printf(COLOR_DIFF[name], cx - 42, cy + r + 6, 84, "center")
+  end
+  love.graphics.setFont(hudFont)
 
   local mx, my = mousePos()
   for i, s in ipairs(STAGES) do
@@ -770,26 +963,69 @@ local function drawMenu()
     love.graphics.rectangle("line", x, y, w, h, 14, 14)
     love.graphics.setColor(0.2, 0.3, 0.4)
     love.graphics.setFont(msgFont)
-    love.graphics.print(i .. "   " .. s.title, x + 20, y + 16)
+    love.graphics.print(i .. "   " .. s.title, x + 16, y + 10)
     love.graphics.setFont(hudFont)
     love.graphics.setColor(0.35, 0.45, 0.55)
-    love.graphics.print(s.sub, x + 20, y + 62)
+    love.graphics.print(s.sub, x + 20, y + 50)
     if s.record then
       local best = Records.best(s.id)
-      love.graphics.printf("BEST " .. (best and fmtTime(best) or "--"), x, y + 16, w - 20, "right")
+      love.graphics.setColor(0.30, 0.55, 0.80)
+      love.graphics.print("BEST " .. (best and fmtTime(best) or "--"), x + 20, y + 70)
     end
   end
 
   love.graphics.setFont(hudFont)
   love.graphics.setColor(0.45, 0.55, 0.65)
-  love.graphics.printf("Lv1-3 and more: coming soon", 0, view.h - 110, view.w, "center")
-  love.graphics.printf("Click or press 1-" .. #STAGES .. "     Esc: quit", 0, view.h - 70, view.w, "center")
+  love.graphics.printf("More levels: coming soon", 0, view.h - 110, view.w, "center")
+  love.graphics.printf("Click or press 1-" .. #STAGES .. "    T: records    Esc: quit", 0, view.h - 70, view.w, "center")
+end
+
+local function drawRecords()
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.setFont(titleFont)
+  love.graphics.printf("RECORDS", 0, 40, view.w, "center")
+  local y = 120
+  for _, s in ipairs(STAGES) do
+    if s.record then
+      love.graphics.setFont(msgFont)
+      love.graphics.setColor(0.2, 0.3, 0.4)
+      love.graphics.print(s.title, 40, y)
+      y = y + msgFont:getHeight() + 6
+      love.graphics.setFont(hudFont)
+      local top = Records.top(s.id)
+      for i = 1, s.record.n do
+        local r = top[i]
+        love.graphics.setColor(0.35, 0.45, 0.55)
+        love.graphics.print(i .. ".", 56, y)
+        if s.record.initials then
+          love.graphics.print((r and r.initials ~= "") and r.initials or "---", 96, y)
+        end
+        love.graphics.print(r and fmtTime(r.time) or "--", 180, y)
+        if r and r.color and r.color ~= "" then
+          local rgb = COLOR_RGB[r.color]
+          if rgb then
+            love.graphics.setColor(rgb[1], rgb[2], rgb[3], 1)
+            love.graphics.circle("fill", 268, y + hudFont:getHeight() * 0.5, 5)
+          end
+        end
+        love.graphics.setColor(0.35, 0.45, 0.55)
+        if r and r.date ~= "" then love.graphics.print(r.date, 330, y) end
+        y = y + hudFont:getHeight() + 4
+      end
+      y = y + 22
+    end
+  end
+  love.graphics.setFont(hudFont)
+  love.graphics.setColor(0.45, 0.55, 0.65)
+  love.graphics.printf("Click or Esc: back", 0, view.h - 70, view.w, "center")
 end
 
 function love.draw()
   love.graphics.push()
   love.graphics.translate(view.ox, view.oy)
   love.graphics.scale(view.scale)
-  if scene == "menu" then drawMenu() else drawPlay() end
+  if scene == "menu" then drawMenu()
+  elseif scene == "records" then drawRecords()
+  else drawPlay() end
   love.graphics.pop()
 end

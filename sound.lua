@@ -201,6 +201,11 @@ end
 local variants, stretchSrc, springSrc = {}, {}, {}
 local creak = nil
 local creakAt, springAt, lastPopIdx = -1, -1, nil
+local pitchScale = 1     -- 音の高さの倍率(ステージごとに変える。大粒は低く、小粒は高く)
+
+function Sound.setPitchScale(k)
+  pitchScale = k or 1
+end
 
 -- 起動時に音を合成する(love.math.setRandomSeed のあとに呼ぶ)
 function Sound.init()
@@ -231,14 +236,14 @@ function Sound.playCreak(vol)
   if now - creakAt < 0.05 then return end     -- 鳴らしすぎ防止
   creakAt = now
   local s = creak:clone()
-  s:setPitch(rand(0.85, 1.25))
+  s:setPitch(rand(0.85, 1.25) * pitchScale)
   s:setVolume(rand(0.25, 0.45) * (vol or 1))
   s:play()
 end
 
 function Sound.playStretch(hard)
   local s = stretchSrc[love.math.random(#stretchSrc)]:clone()
-  s:setPitch(rand(0.85, 1.15))
+  s:setPitch(rand(0.85, 1.15) * pitchScale)
   s:setVolume(hard and rand(0.5, 0.8) or rand(0.3, 0.5))
   s:play()
 end
@@ -248,7 +253,7 @@ function Sound.playSpring(amount)
   if now - springAt < 0.08 then return end    -- 連続で潰したときに鳴りすぎないように
   springAt = now
   local s = springSrc[love.math.random(#springSrc)]:clone()
-  s:setPitch(rand(0.9, 1.1))
+  s:setPitch(rand(0.9, 1.1) * pitchScale)
   s:setVolume(math.min(1, 0.3 + 0.6 * amount))
   s:play()
 end
@@ -259,7 +264,7 @@ function Sound.playPop(idx)
   lastPopIdx = idx
   local v = variants[idx]
   local src = v.src:clone()          -- 重ねて鳴らせるようにクローン
-  src:setPitch(rand(0.82, 1.10))
+  src:setPitch(rand(0.82, 1.10) * pitchScale)
   src:setVolume(rand(0.7, 1.0))
   src:play()
   if love.system.vibrate then        -- 非対応環境では何もしない

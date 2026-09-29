@@ -1,7 +1,8 @@
 -- records.lua: ステージごとの記録(最短時間)の保存と読み込み
 -- 保存先: love.filesystem のセーブフォルダ内の records.dat
 --   (Linux なら ~/.local/share/love/puchipuchi/records.dat)
--- 1件 = { time = 秒(1/100秒単位), initials = "ABC", date = "2026-09-28" }
+-- 1件 = { time = 秒(1/100秒単位), initials = "ABC", date = "2026-09-28", color = "blue" }
+--   color: どの命中判定の広さで出した記録か("blue"|"yellow"|"pink")。無くても動く
 -- ステージ2は上位1件、ステージ3は上位3件+イニシャル、という使い方を想定している
 
 local Records = {}
@@ -17,8 +18,8 @@ local function serialize(t)
   for _, id in ipairs(ids) do
     parts[#parts + 1] = string.format("  [%q] = {\n", id)
     for _, r in ipairs(t[id]) do
-      parts[#parts + 1] = string.format("    { time = %.2f, initials = %q, date = %q },\n",
-                                        r.time, r.initials or "", r.date or "")
+      parts[#parts + 1] = string.format("    { time = %.2f, initials = %q, date = %q, color = %q },\n",
+                                        r.time, r.initials or "", r.date or "", r.color or "")
     end
     parts[#parts + 1] = "  },\n"
   end
@@ -66,11 +67,12 @@ function Records.qualifies(id, time, n)
 end
 
 -- 記録を追加して保存する。上位n位以内なら順位を返す。圏外なら nil
-function Records.add(id, time, n, initials)
+function Records.add(id, time, n, initials, color)
   time = round2(time)
   local list = data[id] or {}
   for i, r in ipairs(list) do r.seq = i end
-  local rec = { time = time, initials = initials or "", date = os.date("%Y-%m-%d"), seq = #list + 1 }
+  local rec = { time = time, initials = initials or "", date = os.date("%Y-%m-%d"),
+                color = color or "", seq = #list + 1 }
   list[#list + 1] = rec
   table.sort(list, function(a, b)
     if a.time ~= b.time then return a.time < b.time end
