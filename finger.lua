@@ -16,7 +16,7 @@ local FW = 50                 -- 親指の太さ(px)
 local FADE0, FADE1 = 60, 155  -- 指先から FADE0 までは不透明、FADE1 までに透明になる
 local STEP = 4                -- メッシュの分割の細かさ(px)
 local ANGLE = math.rad(52)    -- 親指の向き(指先から右下へ伸びる)
-local SQUASH_LEN, SQUASH_WIDE = 0.30, 0.48   -- 押したときの潰れ量(長さ方向/幅方向)
+local SQUASH_LEN, SQUASH_WIDE = 0.14, 0.18   -- 押したときの潰れ量(長さ方向/幅方向)。差を小さくして丸みを残す
 local SINK = 9                -- 押したときに沈む距離(px)
 
 local parts = nil             -- 最初に描くときに作るメッシュ
@@ -98,8 +98,9 @@ function Finger.draw(x, y, press, scale)
   love.graphics.setLineWidth(1.5)
   love.graphics.arc("line", "open", c, 0, c, pi / 2, 3 * pi / 2)
 
-  -- 爪(押すと血の気が引いて白くなる)。親指なので幅広で四角に近い
-  love.graphics.setColor(1, 0.86 + 0.12 * p, 0.84 + 0.14 * p)
+  -- 爪(押すと元の色のまま濃くなる)。親指なので幅広で四角に近い
+  local nr, ng, nb = 1, 0.86, 0.84                                -- 爪の地の色
+  love.graphics.setColor(nr * (1 - 0.30 * p), ng * (1 - 0.38 * p), nb * (1 - 0.40 * p))
   love.graphics.rectangle("fill", FW * 0.26, -FW * 0.33, FW * 0.92, FW * 0.66, FW * 0.24, FW * 0.24)
   love.graphics.setColor(0.80, 0.60, 0.55, 0.70)
   love.graphics.setLineWidth(1)
