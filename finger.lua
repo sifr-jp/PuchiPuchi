@@ -100,7 +100,9 @@ function Finger.draw(x, y, press, scale)
 
   -- 爪(押すと元の色のまま濃くなる)。親指なので幅広で四角に近い
   local nr, ng, nb = 1, 0.86, 0.84                                -- 爪の地の色
-  love.graphics.setColor(nr * (1 - 0.30 * p), ng * (1 - 0.38 * p), nb * (1 - 0.40 * p))
+  local dr, dg, db = 0.92, 0.50, 0.58                             -- 押したときに寄せる濃いピンク
+  local t2 = 0.75 * p                                             -- 寄せる量(1だと寄せすぎるので抑える)
+  love.graphics.setColor(nr + (dr - nr) * t2, ng + (dg - ng) * t2, nb + (db - nb) * t2)
   love.graphics.rectangle("fill", FW * 0.26, -FW * 0.33, FW * 0.92, FW * 0.66, FW * 0.24, FW * 0.24)
   love.graphics.setColor(0.80, 0.60, 0.55, 0.70)
   love.graphics.setLineWidth(1)
