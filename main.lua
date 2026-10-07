@@ -17,12 +17,12 @@
 --   v1.2: Lv1-3 大粒・小粒 / 上位3位とイニシャル入力 / 記録の一覧画面(メニューで T) / ステージごとの音の高さ
 --   v1.3: 命中判定の広さを3段階に(Blue=円全体/Yellow=大きめの中心/Pink=小さい中心)。
 --         メニューで選び、どのステージにも適用。難易度ラベル(EASY/HARD/LUNATIC)を表示
---   v1.4: 記録を色ごとに完全に分離(Blue/Yellow/Pinkで別々のランキング)。記録一覧も色別の列で表示。
---         指カーソルをバネで動かすように(押し込みに勢い/弾み、潰れて沈む動き)
---
--- 次の計画
---   ・スマホへの移植(タッチ操作対応、画面サイズ・解像度の調整)
---   ・Lv2: ローラーシート案(粒がロール状に連なっていて、転がしながら潰していく?)
+--   v1.4: 記録を色ごとに完全に分離(Blue/Yellow/Pinkで別々のランキング)。記録一覧も色別の列で表示
+--   v1.5〜v1.7: 連打対応/BESTの丸の位置修正/指カーソルの潰れ・弾み・爪の色を調整
+--   v1.8: スマホ対応の第一歩。下部にMENU/RESETのタップボタン、イニシャル入力を上下矢印とOK/Skip
+--         ボタンに変更(物理キーボードが無くても遊べるように)。conf.luaにhighdpiを追加
+--   v1.9: 潰れる反応を速く・強めに(押し込み時間短縮、変形量アップ)。潰れなかったときにたまに「ボヨーン」。
+--         メニューにタップできるQUITボタン
 
 local Sound = require("sound")
 local Records = require("records")
@@ -40,6 +40,7 @@ local SPRING_DELAY_MIN = 0.09   -- 「ポコッ」を指を離してから鳴ら
 local SPRING_DELAY_MAX = 0.17
 local CARRY_MAX_GAP = 0.30      -- この時間(秒)以内に次の粒へ移ると、勢いが持ち越される
 local TOP, MARGIN = 60, 16      -- シート上端の位置 / 画面端の余白
+local BAR_H = 46                -- 下部のMENU/RESETボタン帯の高さ(スマホはキーボードが無いため)
 local HUD_H = 50                -- 上部の表示エリアの高さ(スクロール時、ここより上は隠れる)
 local HUD_SIZE = 20             -- 上部の表示文字の大きさ(px)
 local MSG_SIZE = 24             -- メッセージの文字の大きさ(px)
@@ -71,7 +72,9 @@ local leftAt, leftP, leftDwell = -1, 0, 0     -- 直前に離れた粒の記録(
 local elapsed, timing = 0, false              -- 経過時間(秒)と計測中かどうか
 local finished, finishAt, finishInfo = false, 0, nil
 local entering, initials, entryRank = false, "", nil   -- イニシャル入力中か / 入力した文字 / 順位
+local entrySlot = 1                                     -- キーボード入力時、次に入る桁(タップ操作には影響しない)
 local lastInitials = ""                                 -- 直前に入力したイニシャル(次の入力の初期値)
+local INITIAL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"  -- タップで送れる文字(上下ボタン用)
 local fingerPress, fingerPressV = 0, 0        -- 指カーソルの押し込み量(0〜1)とその速度(バネで動かす)
 local FINGER_STIFF, FINGER_DAMP = 420, 16     -- バネの硬さ・減衰。硬いほど速く反応し、減衰が弱いほどよく弾む
 local hudFont, msgFont, titleFont, tinyFont
@@ -131,6 +134,11 @@ local function scrollBy(d)
   scrollY = clamp(scrollY + d, 0, maxScroll)
 end
 
+-- プレイ画面のうち、下部のMENU/RESET帯を除いた実際に遊べる範囲の下端
+local function playBottom()
+  return view.h - BAR_H
+end
+
 ---------------------------------------------------------------
 -- シートの生成とレイアウト
 ---------------------------------------------------------------
@@ -138,7 +146,7 @@ local function calcRows()
   cell = math.min((view.w - 2 * MARGIN) / stage.cols, stage.maxCell or 64)
   if stage.free then
     -- 下端に少しでも見える行まで作る。下端にかかる行は半割になる
-    local y1 = view.h - MARGIN
+    local y1 = playBottom() - MARGIN
     rows = math.max(1, math.ceil((y1 - TOP - 0.19 * cell) / (cell * 0.87)))
   else
     rows = stage.rows
@@ -171,12 +179,12 @@ local function layout()
   sheet.w = math.floor(cols * cell + 0.5)
   local y1
   if stage.free then
-    y1 = math.floor(view.h - MARGIN + 0.5)                       -- 画面の下端で切る
+    y1 = math.floor(playBottom() - MARGIN + 0.5)                 -- MENU/RESET帯の上で切る
   else
     y1 = math.floor(TOP + 0.5 * cell + (rows - 1) * 0.87 * cell + 0.6 * cell + 0.5)
   end
   sheet.h = y1 - sheet.y
-  maxScroll = stage.free and 0 or math.max(0, y1 + MARGIN - view.h)
+  maxScroll = stage.free and 0 or math.max(0, y1 + MARGIN - playBottom())
   scrollY = clamp(scrollY, 0, maxScroll)
   local x0, y0 = sheet.x, sheet.y
   local x1 = x0 + sheet.w
@@ -247,6 +255,13 @@ local function newSheet()
 end
 
 -- (mx, wy): シート上の座標(スクロール分を足したもの)
+-- 下部のMENU/RESET帯のどちらを押したか("menu" / "reset" / nil)。スマホに物理キーがないため常設する
+local function barHit(mx, my)
+  if my < playBottom() or my > view.h then return nil end
+  if mx < view.w / 2 then return "menu" end
+  return "reset"
+end
+
 local function hit(mx, wy)
   if mx < sheet.x or mx > sheet.x + sheet.w or wy < sheet.y or wy > sheet.y + sheet.h then
     return nil                                     -- 切り落とされた部分は触れない
@@ -269,6 +284,15 @@ end
 ---------------------------------------------------------------
 local function menuCard(i)
   return 40, 258 + (i - 1) * 110, view.w - 80, 92
+end
+
+-- メニュー下部の「記録」「終了」ボタン(スマホには T キーも Esc キーも無いため、タップでも操作できるようにする)
+local function recordsButtonRect()
+  return view.w / 2 - 164, 706, 150, 36
+end
+
+local function quitButtonRect()
+  return view.w / 2 + 14, 706, 150, 36
 end
 
 -- メニュー上部の色スウォッチ(命中判定の広さの選択)。3つを横に並べる
@@ -319,6 +343,21 @@ local function exitToMenu()
   updateView()
 end
 
+-- 3桁に満たない分は A で埋める(タップの上下ボタンで必ず文字が見えるようにするため)
+local function padInitials(s)
+  while #s < 3 do s = s .. "A" end
+  return s:sub(1, 3)
+end
+
+-- 桁 i の文字を dir(+1/-1)分だけ送る。タップの上下ボタンと、キーボードの上下キーの両方が使う
+local function cycleSlot(i, dir)
+  initials = padInitials(initials)
+  local ch = initials:sub(i, i)
+  local idx = INITIAL_CHARS:find(ch, 1, true) or 1
+  idx = ((idx - 1 + dir) % #INITIAL_CHARS) + 1
+  initials = initials:sub(1, i - 1) .. INITIAL_CHARS:sub(idx, idx) .. initials:sub(i + 1)
+end
+
 -- イニシャルを確定して記録する
 local function confirmEntry()
   local rank = Records.add(recId(), elapsed, stage.record.n, initials, colorMode)
@@ -327,9 +366,52 @@ local function confirmEntry()
   finishInfo = { rank = rank }
 end
 
+-- 入力せず、記録も残さずに進める
+local function skipEntry()
+  entering = false
+  finishInfo = { rank = nil }
+end
+
 ---------------------------------------------------------------
 -- LÖVE コールバック
 ---------------------------------------------------------------
+-- イニシャル入力パネルの寸法。描画とタップ判定の両方がここから座標を取る
+local function entryLayout()
+  local lh = msgFont:getHeight()
+  local th = titleFont:getHeight()
+  local slotW = 60
+  local arrowH = 30
+  local btnH = 38
+  local bw = 380
+  local bh = lh * 2 + arrowH + th + arrowH + btnH + 56
+  local px = (view.w - bw) / 2
+  local py = HUD_H + (playBottom() - HUD_H - bh) / 2
+  local x0 = px + (bw - slotW * 3) / 2
+  local upY = py + 16 + lh * 2 + 8
+  local letterY = upY + arrowH + 4
+  local downY = letterY + th + 4
+  local slots = {}
+  for i = 1, 3 do
+    local sx = x0 + (i - 1) * slotW
+    slots[i] = {
+      x = sx, w = slotW,
+      up = { x = sx + 6, y = upY, w = slotW - 12, h = arrowH },
+      letterY = letterY,
+      down = { x = sx + 6, y = downY, w = slotW - 12, h = arrowH },
+    }
+  end
+  local byy = downY + arrowH + 14
+  local okRect = { x = px + bw / 2 - 128, y = byy, w = 116, h = btnH }
+  local skipRect = { x = px + bw / 2 + 12, y = byy, w = 116, h = btnH }
+  return { px = px, py = py, bw = bw, bh = bh, lh = lh, th = th,
+           slots = slots, okRect = okRect, skipRect = skipRect }
+end
+
+local function pointIn(r, mx, my)
+  return mx >= r.x and mx <= r.x + r.w and my >= r.y and my <= r.y + r.h
+end
+
+
 function love.load()
   love.keyboard.setTextInput(false)     -- 日本語入力(IME)がキーを横取りしないようにする
   love.graphics.setBackgroundColor(0.86, 0.92, 0.96)
@@ -358,13 +440,29 @@ function love.mousepressed(x, y, button)
     if button == 1 then
       local c = colorSwatchHit(mx, sy)
       if c then colorMode = c return end
+      local rx, ry, rw, rh = recordsButtonRect()
+      if mx >= rx and mx <= rx + rw and sy >= ry and sy <= ry + rh then scene = "records" return end
+      local qx, qy, qw, qh = quitButtonRect()
+      if mx >= qx and mx <= qx + qw and sy >= qy and sy <= qy + qh then love.event.quit() return end
       local i = menuHit(mx, sy)
       if i then enterStage(i) end
     end
     return
   end
   if button ~= 1 then return end
-  if entering then return end                          -- イニシャル入力中はキーボードで入力する
+  if entering then                                      -- イニシャル入力中はタップで操作する
+    local L = entryLayout()
+    for i, s in ipairs(L.slots) do
+      if pointIn(s.up, mx, sy) then cycleSlot(i, 1) return end
+      if pointIn(s.down, mx, sy) then cycleSlot(i, -1) return end
+    end
+    if pointIn(L.okRect, mx, sy) then confirmEntry() return end
+    if pointIn(L.skipRect, mx, sy) then skipEntry() return end
+    return
+  end
+  local barTap = barHit(mx, sy)                         -- 下部のMENU/RESET帯(物理キーが無くても操作できる)
+  if barTap == "menu" then exitToMenu() return end
+  if barTap == "reset" then newSheet() return end
   if finished then
     if love.timer.getTime() - finishAt > FINISH_LOCK then newSheet() end   -- 全部潰したらクリックで再挑戦
     return
@@ -372,7 +470,7 @@ function love.mousepressed(x, y, button)
   if sy < HUD_H then return end
   local b = hit(mx, sy + scrollY)
   if b and not b.popped then
-    b.press = b.press + rand(0.30, 0.55)              -- 素早いタップでも力が積み重なる
+    b.press = b.press + rand(0.45, 0.75)              -- 素早いタップでも力が積み重なる(実機のタップに合わせて強めに)
     b.dwell = 0
     lastTarget = b
     Sound.playCreak(b.cut and 0.3 or 1)
@@ -405,16 +503,24 @@ function love.keypressed(key, scancode)
     if i and STAGES[i] then enterStage(i) end
     return
   end
-  if entering then                                        -- イニシャル入力中(Rなどの文字はここで入力になる)
-    if key == "backspace" then
-      initials = initials:sub(1, -2)
-    elseif key == "return" or key == "kpenter" then
-      if #initials >= 1 then confirmEntry() end
+  if entering then                                        -- イニシャル入力中
+    -- 画面のタップ(上下ボタン・OK・Skip)がメインだが、キーボードがあれば以下でも操作できる
+    if key == "return" or key == "kpenter" then
+      confirmEntry()
     elseif key == "escape" then
-      entering = false                                    -- 入力せず、記録も残さない
-      finishInfo = { rank = nil }
-    elseif #key == 1 and key:match("^%w$") and #initials < 3 then
-      initials = initials .. key:upper()
+      skipEntry()
+    elseif key == "left" or key == "backspace" then
+      entrySlot = math.max(1, entrySlot - 1)
+    elseif key == "right" then
+      entrySlot = math.min(3, entrySlot + 1)
+    elseif key == "up" then
+      cycleSlot(entrySlot, 1)
+    elseif key == "down" then
+      cycleSlot(entrySlot, -1)
+    elseif #key == 1 and key:match("^%w$") then
+      initials = padInitials(initials)
+      initials = initials:sub(1, entrySlot - 1) .. key:upper() .. initials:sub(entrySlot + 1)
+      entrySlot = math.min(3, entrySlot + 1)
     end
     return
   end
@@ -524,7 +630,7 @@ function love.update(dt)
         b.held = true
         b.dwell = b.dwell + dt
         -- 押し込み速度は粒ごとに違い、しかも時間とともに滑らかに揺らぐ
-        local wave = 0.55 + 0.9 * love.math.noise(b.seed, now * 3)
+        local wave = 0.80 + 0.7 * love.math.noise(b.seed, now * 3)  -- 下限を上げて反応の鈍さを減らす
         b.press = b.press + dt / stage.pressTime * b.speed * wave
         if b.press >= b.thresh then
           pop(b)
@@ -540,7 +646,11 @@ function love.update(dt)
             -- 空気が戻る「ポコッ」は少し遅れて鳴る。揺れも同じタイミングで始める
             later(rand(SPRING_DELAY_MIN, SPRING_DELAY_MAX), function()
               if not b.popped then
-                Sound.playSpring(p)
+                if p > 0.55 and love.math.random() < 0.16 then
+                  Sound.playBoyoon(p)             -- たまにコミカルな「ボヨーン」を鳴らす
+                else
+                  Sound.playSpring(p)
+                end
                 b.wobA, b.wobT = p, 0
               end
             end)
@@ -565,7 +675,7 @@ function love.update(dt)
         -- 上位に入ったら、イニシャルを入力してから記録する
         entryRank = Records.qualifies(recId(), elapsed, rec.n)
         if entryRank then
-          entering, initials = true, lastInitials
+          entering, initials, entrySlot = true, padInitials(lastInitials), 1
         else
           finishInfo = { rank = nil }
         end
@@ -584,9 +694,9 @@ end
 local function drawIntact(b)
   local p = math.min(1, b.press / b.thresh)       -- 破裂までの張り具合 0〜1
   local hk = b.hard and 1.6 or 1.0                -- 伸びる粒ほど大きく変形する
-  local s = 0.18 * hk * p                         -- 押しつぶされた量
+  local s = 0.27 * hk * p                         -- 押しつぶされた量(潰れた感を強める)
   local wob = b.wobA * 0.10 * math.sin(b.wobT * 38) * math.exp(-b.wobT * 9)
-  local rx = 1 + 0.6 * s - wob * 0.6              -- 空気が横へ逃げて横に広がり
+  local rx = 1 + 0.75 * s - wob * 0.6              -- 空気が横へ逃げて横に広がり
   local ry = 1 - s + wob                          -- 縦につぶれる
   local tn = b.tint
   local r = b.rad
@@ -680,7 +790,7 @@ local function clipSheet()
   local x0 = math.max(sheet.x, 0)
   local y0 = math.max(sheet.y - scrollY, HUD_H)
   local x1 = math.min(sheet.x + sheet.w, view.w)
-  local y1 = math.min(sheet.y + sheet.h - scrollY, view.h)
+  local y1 = math.min(sheet.y + sheet.h - scrollY, playBottom())
   if x1 <= x0 or y1 <= y0 then return false end
   setScissor(x0, y0, x1 - x0, y1 - y0)
   return true
@@ -769,7 +879,7 @@ end
 local function drawScrollbar()
   if maxScroll <= 0 then return end
   local x = view.w - 10
-  local y0, h = HUD_H + 4, view.h - HUD_H - 8
+  local y0, h = HUD_H + 4, playBottom() - HUD_H - 8
   local worldH = maxScroll + view.h
   love.graphics.setColor(0.2, 0.3, 0.4, 0.12)
   love.graphics.rectangle("fill", x, y0, 6, h, 3, 3)
@@ -829,7 +939,7 @@ local function drawFinishPanel()
   end
   local bw, bh = lw + 48, lh * #items + 32
   local px = (view.w - bw) / 2
-  local py = HUD_H + (view.h - HUD_H - bh) / 2
+  local py = HUD_H + (playBottom() - HUD_H - bh) / 2
   drawPanelFrame(px, py, bw, bh)
   local y = py + 16
   for _, it in ipairs(items) do
@@ -857,45 +967,57 @@ local function drawFinishPanel()
 end
 
 -- イニシャル入力のパネル(上位に入ったとき)
+local function drawEntryButton(r, label, accent)
+  love.graphics.setColor(accent and 0.35 or 1, accent and 0.65 or 1, accent and 0.95 or 1, accent and 1 or 0.9)
+  love.graphics.rectangle("fill", r.x, r.y, r.w, r.h, 8, 8)
+  love.graphics.setColor(0.35, 0.5, 0.7, 0.7)
+  love.graphics.setLineWidth(1)
+  love.graphics.rectangle("line", r.x, r.y, r.w, r.h, 8, 8)
+  love.graphics.setColor(accent and 1 or 0.2, accent and 1 or 0.3, accent and 1 or 0.4)
+  love.graphics.printf(label, r.x, r.y + (r.h - hudFont:getHeight()) / 2, r.w, "center")
+end
+
 local function drawEntryPanel()
-  local lh = msgFont:getHeight()
-  local th = titleFont:getHeight()
-  local bw = 380
-  local bh = lh * 2 + th + hudFont:getHeight() + 64
-  local px = (view.w - bw) / 2
-  local py = HUD_H + (view.h - HUD_H - bh) / 2
-  drawPanelFrame(px, py, bw, bh)
+  local L = entryLayout()
+  drawPanelFrame(L.px, L.py, L.bw, L.bh)
 
   love.graphics.setFont(msgFont)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.printf("NEW RANK #" .. tostring(entryRank) .. "!", px, py + 16, bw, "center")
-  love.graphics.printf(fmtTime(elapsed), px, py + 16 + lh, bw, "center")
-
-  love.graphics.setFont(titleFont)
-  local slotW = 56
-  local x0 = px + (bw - slotW * 3) / 2
-  local sy = py + 24 + lh * 2
-  local blink = math.floor(love.timer.getTime() * 2) % 2 == 0
-  for i = 1, 3 do
-    local sx = x0 + (i - 1) * slotW
-    local ch = initials:sub(i, i)
-    if ch ~= "" then
-      love.graphics.setColor(0.2, 0.3, 0.4)
-      love.graphics.printf(ch, sx, sy, slotW, "center")
-    end
-    local active = (i == #initials + 1) and blink               -- 次に入力する位置の下線が点滅する
-    love.graphics.setColor(0.35, 0.6, 0.9, active and 1 or 0.45)
-    love.graphics.rectangle("fill", sx + 8, sy + th - 2, slotW - 16, 3)
-  end
+  love.graphics.printf("NEW RANK #" .. tostring(entryRank) .. "!", L.px, L.py + 16, L.bw, "center")
+  love.graphics.printf(fmtTime(elapsed), L.px, L.py + 16 + L.lh, L.bw, "center")
 
   love.graphics.setFont(hudFont)
-  love.graphics.setColor(0.35, 0.45, 0.55)
-  love.graphics.printf("Type letters   Enter: OK   Esc: skip", px, py + bh - hudFont:getHeight() - 14, bw, "center")
+  for i, s in ipairs(L.slots) do                                  -- 桁ごとの上下ボタンと文字
+    drawEntryButton(s.up, "▲", i == entrySlot)
+    drawEntryButton(s.down, "▼", i == entrySlot)
+    love.graphics.setFont(titleFont)
+    love.graphics.setColor(0.2, 0.3, 0.4)
+    love.graphics.printf(initials:sub(i, i), s.x, s.letterY, s.w, "center")
+    love.graphics.setFont(hudFont)
+  end
+
+  drawEntryButton(L.okRect, "OK", true)
+  drawEntryButton(L.skipRect, "Skip", false)
+end
+
+-- 下部のMENU/RESET帯。物理キーボードが無いスマホでも、メニューに戻る・やり直すができるように常設する
+local function drawBar()
+  local by = playBottom()
+  love.graphics.setColor(1, 1, 1, 0.55)
+  love.graphics.rectangle("fill", 0, by, view.w, BAR_H)
+  love.graphics.setColor(0.5, 0.75, 0.95, 0.6)
+  love.graphics.setLineWidth(1)
+  love.graphics.line(0, by, view.w, by)
+  love.graphics.line(view.w / 2, by, view.w / 2, view.h)
+  love.graphics.setFont(hudFont)
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.printf("MENU", 0, by + (BAR_H - hudFont:getHeight()) / 2, view.w / 2, "center")
+  love.graphics.printf("RESET", view.w / 2, by + (BAR_H - hudFont:getHeight()) / 2, view.w / 2, "center")
 end
 
 local function drawPlay()
   -- シート(スクロールする層)
-  setScissor(0, HUD_H, view.w, view.h - HUD_H)
+  setScissor(0, HUD_H, view.w, playBottom() - HUD_H)
   love.graphics.push()
   love.graphics.translate(0, -scrollY)
   drawSheet()
@@ -907,7 +1029,7 @@ local function drawPlay()
     end
   end
   drawFilm()
-  setScissor(0, HUD_H, view.w, view.h - HUD_H)
+  setScissor(0, HUD_H, view.w, playBottom() - HUD_H)
   drawCutEdges()
   love.graphics.pop()
   love.graphics.setScissor()
@@ -935,6 +1057,7 @@ local function drawPlay()
   end
 
   drawScrollbar()
+  if not entering then drawBar() end                              -- 入力中はうっかり押さないよう隠す
   if entering then drawEntryPanel() elseif finished then drawFinishPanel() end
 
   if useFinger() then                                            -- 指のカーソル(いちばん手前)
@@ -994,8 +1117,28 @@ local function drawMenu()
 
   love.graphics.setFont(hudFont)
   love.graphics.setColor(0.45, 0.55, 0.65)
-  love.graphics.printf("More levels: coming soon", 0, view.h - 110, view.w, "center")
-  love.graphics.printf("Click or press 1-" .. #STAGES .. "    T: records    Esc: quit", 0, view.h - 70, view.w, "center")
+  love.graphics.printf("More levels: coming soon", 0, 684, view.w, "center")
+
+  local rx, ry, rw, rh = recordsButtonRect()
+  love.graphics.setColor(1, 1, 1, 0.85)
+  love.graphics.rectangle("fill", rx, ry, rw, rh, 10, 10)
+  love.graphics.setColor(0.5, 0.75, 0.95, 0.9)
+  love.graphics.setLineWidth(1.5)
+  love.graphics.rectangle("line", rx, ry, rw, rh, 10, 10)
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.printf("RECORDS", rx, ry + (rh - hudFont:getHeight()) / 2, rw, "center")
+
+  local qx, qy, qw, qh = quitButtonRect()           -- Escキーが無い端末でも終了できる実体のあるボタン
+  love.graphics.setColor(1, 1, 1, 0.85)
+  love.graphics.rectangle("fill", qx, qy, qw, qh, 10, 10)
+  love.graphics.setColor(0.95, 0.55, 0.55, 0.9)
+  love.graphics.setLineWidth(1.5)
+  love.graphics.rectangle("line", qx, qy, qw, qh, 10, 10)
+  love.graphics.setColor(0.45, 0.25, 0.25)
+  love.graphics.printf("QUIT", qx, qy + (qh - hudFont:getHeight()) / 2, qw, "center")
+
+  love.graphics.setColor(0.45, 0.55, 0.65)
+  love.graphics.printf("Press 1-" .. #STAGES .. " or tap a stage", 0, 758, view.w, "center")
 end
 
 -- 記録は色ごとに分かれているので、Blue/Yellow/Pinkを3列に並べて表示する

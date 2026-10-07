@@ -5,6 +5,7 @@ function love.conf(t)
   t.window.width = 480
   t.window.height = 800
   t.window.resizable = true
+  t.window.highdpi = true         -- スマホの高精細画面で描画がぼやけないように
   t.modules.physics = false
   t.modules.video = false
   t.modules.joystick = false

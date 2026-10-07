@@ -197,8 +197,29 @@ local function makeSpring()
   return toSource(buf, n, 0.7)
 end
 
+-- 潰れなかったときに、たまに鳴るコミカルな「ボヨーン」(震えながら間延びして戻る)
+local function makeBoyoon()
+  local n = math.floor(SAMPLE_RATE * 0.38)
+  local bp = bandpass(rand(480, 680), 1.3)
+  local f0 = rand(230, 290)
+  local vibHz = rand(13, 17)        -- 震える速さ
+  local vibDepth = rand(0.32, 0.48) -- 震えの深さ(大きいほどコミカル)
+  local phase = 0
+  local buf = {}
+  for i = 0, n - 1 do
+    local t = i / SAMPLE_RATE
+    local env = math.exp(-t / 0.15)
+    local vib = 1 + vibDepth * math.exp(-t / 0.11) * math.sin(2 * pi * vibHz * t)
+    local fr = f0 * vib
+    phase = phase + 2 * pi * fr / SAMPLE_RATE
+    local noise = love.math.random() * 2 - 1
+    local fade = math.min(1, (n - 1 - i) / 300)
+    buf[i] = (math.sin(phase) * env + bp(noise) * 0.22 * math.exp(-t / 0.03)) * fade
+  end
+  return toSource(buf, n, 0.65)
+end
 
-local variants, stretchSrc, springSrc = {}, {}, {}
+local variants, stretchSrc, springSrc, boyoonSrc = {}, {}, {}, {}
 local creak = nil
 local creakAt, springAt, lastPopIdx = -1, -1, nil
 local pitchScale = 1     -- 音の高さの倍率(ステージごとに変える。大粒は低く、小粒は高く)
@@ -228,6 +249,7 @@ function Sound.init()
   for i = 1, 3 do
     stretchSrc[i] = makeStretch()
     springSrc[i] = makeSpring()
+    boyoonSrc[i] = makeBoyoon()
   end
 end
 
@@ -255,6 +277,18 @@ function Sound.playSpring(amount)
   local s = springSrc[love.math.random(#springSrc)]:clone()
   s:setPitch(rand(0.9, 1.1) * pitchScale)
   s:setVolume(math.min(1, 0.3 + 0.6 * amount))
+  s:play()
+end
+
+local boyoonAt = -1
+-- 潰れずに戻るときに、たまに鳴らすコミカルな「ボヨーン」。playSpringの代わりに呼ぶ
+function Sound.playBoyoon(amount)
+  local now = love.timer.getTime()
+  if now - boyoonAt < 0.6 then return end     -- 連続で鳴りすぎないように
+  boyoonAt = now
+  local s = boyoonSrc[love.math.random(#boyoonSrc)]:clone()
+  s:setPitch(rand(0.85, 1.15) * pitchScale)
+  s:setVolume(math.min(1, 0.45 + 0.45 * (amount or 1)))
   s:play()
 end
 
