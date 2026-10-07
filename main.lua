@@ -21,8 +21,6 @@
 --   v1.5〜v1.7: 連打対応/BESTの丸の位置修正/指カーソルの潰れ・弾み・爪の色を調整
 --   v1.8: スマホ対応の第一歩。下部にMENU/RESETのタップボタン、イニシャル入力を上下矢印とOK/Skip
 --         ボタンに変更(物理キーボードが無くても遊べるように)。conf.luaにhighdpiを追加
---   v1.9: 潰れる反応を速く・強めに(押し込み時間短縮、変形量アップ)。潰れなかったときにたまに「ボヨーン」。
---         メニューにタップできるQUITボタン
 
 local Sound = require("sound")
 local Records = require("records")
@@ -81,11 +79,22 @@ local hudFont, msgFont, titleFont, tinyFont
 
 -- 命中判定の広さ(粒の半径に対する割合)。狭いほど、粒の中心付近に正確に触れないと反応しない
 local COLOR_MODES = { "blue", "yellow", "pink" }
-local COLOR_FACTOR = { blue = 1.00, yellow = 0.55, pink = 0.30 }
+local COLOR_FACTOR = { blue = 1.00, yellow = 0.55, pink = 0.38 }
 local COLOR_LABEL  = { blue = "BLUE", yellow = "YELLOW", pink = "PINK" }
 local COLOR_DIFF   = { blue = "EASY", yellow = "HARD", pink = "LUNATIC" }   -- 難易度の目安
 local COLOR_RGB    = { blue = { 0.35, 0.60, 0.95 }, yellow = { 0.85, 0.68, 0.15 }, pink = { 0.90, 0.45, 0.65 } }
+-- 命中半径の下限(px)。粒の大きいステージ(Big/Large)では割合そのままだと判定円が
+-- 指で狙うには小さすぎる大きさになってしまうため、最低限の大きさを保証する
+local COLOR_MINPX = { pink = 12 }
 local colorMode = "blue"                      -- メニューで選んだ命中判定の広さ(全ステージ共通)
+
+-- 命中判定の半径(px)。上の割合に加えて、PINKでは下限を適用する
+local function hitRadiusOf(b)
+  local r = b.rad * (COLOR_FACTOR[colorMode] or 1)
+  local minPx = COLOR_MINPX[colorMode]
+  if minPx and r < minPx then r = minPx end
+  return r
+end
 
 local function rand(a, b) return a + (b - a) * love.math.random() end
 local function later(delay, fn) pending[#pending + 1] = { t = delay, fn = fn } end
@@ -266,10 +275,10 @@ local function hit(mx, wy)
   if mx < sheet.x or mx > sheet.x + sheet.w or wy < sheet.y or wy > sheet.y + sheet.h then
     return nil                                     -- 切り落とされた部分は触れない
   end
-  local r2 = (COLOR_FACTOR[colorMode] or 1) ^ 2
   for _, b in ipairs(bubbles) do
     local dx, dy = mx - b.x, wy - b.y
-    if dx * dx + dy * dy <= b.rad * b.rad * r2 then return b end
+    local hr = hitRadiusOf(b)
+    if dx * dx + dy * dy <= hr * hr then return b end
   end
 end
 
@@ -420,6 +429,7 @@ function love.load()
   titleFont = love.graphics.newFont(TITLE_SIZE)
   tinyFont = love.graphics.newFont(13)
   love.math.setRandomSeed(os.time())
+  love.audio.setVolume(1.6)             -- 全体的に音が小さいとの要望でマスター音量を底上げ
   Sound.init()
   Records.load()
   updateView()
@@ -604,27 +614,33 @@ function love.update(dt)
       leftDwell = prev.dwell
     end
     if target and not target.popped then
-      local slow = 1 - math.min(1, mspeed / (cell * SWIPE_FAST))
-      local force = (0.08 + 0.55 * slow) * rand(0.6, 1.3)
-      local gap = now - leftAt
-      if gap < CARRY_MAX_GAP then
-        local carry = leftP * 0.3 + math.min(leftDwell, 0.6) * 0.3
-        force = force + carry * (1 - gap / CARRY_MAX_GAP) * rand(0.7, 1.2)
+      if target.cut then                                -- 半割の粒は絶対に潰れないので、触れた瞬間に必ずボヨーンを鳴らす
+        Sound.playBoyoon(0.7)
+        target.wobA, target.wobT = 0.7, 0
+      else
+        local slow = 1 - math.min(1, mspeed / (cell * SWIPE_FAST))
+        local force = (0.08 + 0.55 * slow) * rand(0.6, 1.3)
+        local gap = now - leftAt
+        if gap < CARRY_MAX_GAP then
+          local carry = leftP * 0.3 + math.min(leftDwell, 0.6) * 0.3
+          force = force + carry * (1 - gap / CARRY_MAX_GAP) * rand(0.7, 1.2)
+        end
+        target.press = target.press + force
+        target.dwell = 0
+        Sound.playCreak(0.5 + 0.5 * slow)
       end
-      target.press = target.press + force
-      target.dwell = 0
-      Sound.playCreak(target.cut and 0.3 or (0.5 + 0.5 * slow))
     end
     lastTarget = target
   end
 
   for _, b in ipairs(bubbles) do
-    if b.cut then                                      -- 半割の粒: 押されて凹むだけで破裂しない
+    if b.cut then                                      -- 半割の粒: 押されて凹むだけで破裂しない(ボヨーンは触れた瞬間に鳴る)
       if b == target then
         b.press = math.min(0.45, b.press + dt / stage.pressTime * 0.6)
       else
         b.press = math.max(0, b.press - dt / RELEASE_TIME)
       end
+      b.wobT = b.wobT + dt
     elseif not b.popped then
       if b == target then
         b.held = true
@@ -642,11 +658,11 @@ function love.update(dt)
         if b.held then                                     -- 指を離した瞬間
           b.held = false
           local p = math.min(1, b.press / b.thresh)
-          if p > 0.35 then
+          if p > 0.15 then                                 -- 軽く触れただけでも弾みの反応を出す(ボヨーンの機会を増やす)
             -- 空気が戻る「ポコッ」は少し遅れて鳴る。揺れも同じタイミングで始める
             later(rand(SPRING_DELAY_MIN, SPRING_DELAY_MAX), function()
               if not b.popped then
-                if p > 0.55 and love.math.random() < 0.16 then
+                if love.math.random() < 0.35 then
                   Sound.playBoyoon(p)             -- たまにコミカルな「ボヨーン」を鳴らす
                 else
                   Sound.playSpring(p)
@@ -694,12 +710,17 @@ end
 local function drawIntact(b)
   local p = math.min(1, b.press / b.thresh)       -- 破裂までの張り具合 0〜1
   local hk = b.hard and 1.6 or 1.0                -- 伸びる粒ほど大きく変形する
-  local s = 0.27 * hk * p                         -- 押しつぶされた量(潰れた感を強める)
-  local wob = b.wobA * 0.10 * math.sin(b.wobT * 38) * math.exp(-b.wobT * 9)
-  local rx = 1 + 0.75 * s - wob * 0.6              -- 空気が横へ逃げて横に広がり
+  local r = b.rad
+  -- Largeステージの「プルプルした余韻」の感じを他ステージにも揃える。
+  -- 見た目の変形量が粒の半径で薄まらないよう、見かけのピクセル量がほぼ一定になるように調整する
+  -- (半径が小さい粒ほど比率を大きくする。16px/10pxはLargeの平均半径でだいたい元の係数と一致する基準値)
+  local sqFrac = math.max(0.25, math.min(0.55, 16 / r))
+  local wobFrac = math.max(0.15, math.min(0.40, 10 / r))
+  local s = sqFrac * hk * p                       -- 押しつぶされた量
+  local wob = b.wobA * wobFrac * math.sin(b.wobT * 32) * math.exp(-b.wobT * 6.5)  -- 潰れなかった時の弾み
+  local rx = 1 + 0.85 * s - wob * 0.7              -- 空気が横へ逃げて横に広がり
   local ry = 1 - s + wob                          -- 縦につぶれる
   local tn = b.tint
-  local r = b.rad
 
   love.graphics.push()
   love.graphics.translate(b.x, b.y)
@@ -748,13 +769,13 @@ local function drawIntact(b)
     local rgb = COLOR_RGB[colorMode]
     love.graphics.setColor(rgb[1], rgb[2], rgb[3], 0.55)
     love.graphics.setLineWidth(1.5)
-    love.graphics.circle("line", b.x, b.y, r * COLOR_FACTOR[colorMode])
+    love.graphics.circle("line", b.x, b.y, hitRadiusOf(b))
   end
 end
 
 local function drawPopped(b)
   local k = math.min(1, b.t / 0.1)
-  local r = b.rad * (1 - 0.12 * k)
+  local r = b.rad * (1 - 0.20 * k)                              -- 潰れた直後、もう少し大きく縮む
   love.graphics.setColor(0.72, 0.84, 0.92, 0.5)                 -- しぼんだ円盤
   love.graphics.circle("fill", b.x, b.y, r)
   love.graphics.setColor(0.5, 0.65, 0.8, 0.5)
@@ -770,14 +791,14 @@ local function drawPopped(b)
   end
   love.graphics.setColor(0.3, 0.45, 0.6, 0.45)                  -- 破れた小さな穴
   love.graphics.ellipse("fill", b.x + b.hx * r, b.y + b.hy * r, r * 0.07, r * 0.045)
-  if b.t < 0.25 then                                            -- 破裂の一瞬の演出
-    local q = b.t / 0.25
-    love.graphics.setColor(1, 1, 1, 0.9 * (1 - q))
-    love.graphics.setLineWidth(2)
-    love.graphics.circle("line", b.x, b.y, b.rad * (1 + 0.6 * q))
-    if b.t < 0.08 then
-      love.graphics.setColor(1, 1, 1, 0.6 * (1 - b.t / 0.08))
-      love.graphics.circle("fill", b.x, b.y, b.rad)
+  if b.t < 0.32 then                                            -- 破裂の一瞬の演出(もう少し大きく・長く)
+    local q = b.t / 0.32
+    love.graphics.setColor(1, 1, 1, 0.95 * (1 - q))
+    love.graphics.setLineWidth(3)
+    love.graphics.circle("line", b.x, b.y, b.rad * (1 + 1.0 * q))
+    if b.t < 0.10 then
+      love.graphics.setColor(1, 1, 1, 0.7 * (1 - b.t / 0.10))
+      love.graphics.circle("fill", b.x, b.y, b.rad * 1.08)
     end
   end
 end

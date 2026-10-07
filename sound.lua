@@ -216,7 +216,7 @@ local function makeBoyoon()
     local fade = math.min(1, (n - 1 - i) / 300)
     buf[i] = (math.sin(phase) * env + bp(noise) * 0.22 * math.exp(-t / 0.03)) * fade
   end
-  return toSource(buf, n, 0.65)
+  return toSource(buf, n, 0.95)
 end
 
 local variants, stretchSrc, springSrc, boyoonSrc = {}, {}, {}, {}
@@ -282,13 +282,16 @@ end
 
 local boyoonAt = -1
 -- 潰れずに戻るときに、たまに鳴らすコミカルな「ボヨーン」。playSpringの代わりに呼ぶ
+-- ステージごとのピッチ差(大粒=低い/小粒=高い)をそのまま使うと小粒ステージで薄く聞き取りにくくなるため、
+-- 差を弱めて低めの音域を保ち、どのステージでも同じくらいはっきり聞こえるようにする
 function Sound.playBoyoon(amount)
   local now = love.timer.getTime()
-  if now - boyoonAt < 0.6 then return end     -- 連続で鳴りすぎないように
+  if now - boyoonAt < 0.10 then return end    -- 同じ粒を押し続けている間だけ連続再生を防ぐ(触れるたびに必ず鳴らしたい)
   boyoonAt = now
   local s = boyoonSrc[love.math.random(#boyoonSrc)]:clone()
-  s:setPitch(rand(0.85, 1.15) * pitchScale)
-  s:setVolume(math.min(1, 0.45 + 0.45 * (amount or 1)))
+  local ps = 0.6 + 0.4 * pitchScale
+  s:setPitch(rand(0.85, 1.15) * ps)
+  s:setVolume(rand(0.92, 1.0))        -- amount(押し込み量)に左右されず、毎回はっきり聞こえる音量にする
   s:play()
 end
 
