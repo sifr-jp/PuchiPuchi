@@ -15,6 +15,12 @@
 --   scroll      true: シートが画面より大きく、スクロールして遊ぶ
 --   record      { n = 残す件数, initials = true }。省略するとタイムを記録しない
 --               initials = true のときは、上位に入ったらイニシャル(3文字まで)を入力する
+--   level       メニューのどのレベルに出すか。省略時は 1
+--   mode        省略: Lv1 と同じ(シートを全部潰す)
+--               "roller": ローラー送り(Lv2-1)。シートが上から繰り出され、下で巻き取られる
+--   time        mode = "roller" のときの制限時間(秒)。色ごとに { blue =, yellow =, pink = }
+--               シートは一定の速さで送られ、最後の段がちょうど制限時間で下端に着く
+--               Lv2 では色は制限時間などを決め、命中判定はいつも Blue と同じ広さ
 
 -- 潰せる粒の数: 奇数行は cols 個、偶数行は両端が半割なので (cols - 1) 個
 local function count(cols, rows)
@@ -24,6 +30,7 @@ end
 local L12_COLS, L12_ROWS = 8, 40     -- 約300粒(画面の約2.5倍の高さ)
 local L13L_COLS, L13L_ROWS = 5, 34   -- 大粒: 約150粒(画面の約3.3倍の高さ)
 local L13S_COLS, L13S_ROWS = 14, 38  -- 小粒: 約500粒(画面の約1.4倍の高さ)
+local L21_COLS, L21_ROWS = 8, 16     -- ローラー送り: 120粒(Blue/Yellow/Pink 共通)
 
 return {
   {
@@ -52,6 +59,14 @@ return {
     free = false, cols = L13S_COLS, rows = L13S_ROWS, maxCell = 40,
     hardRatio = 0.20, pressTime = 0.15,
     finger = true, fingerScale = 0.7, soundPitch = 1.3, scroll = true,
+    record = { n = 3, initials = true },
+  },
+  {
+    id = "2-1", title = "Lv2-1  Roller", level = 2, mode = "roller",
+    sub = count(L21_COLS, L21_ROWS) .. " bubbles  /  time limit  /  top 3",
+    free = false, cols = L21_COLS, rows = L21_ROWS, hardRatio = 0.15, pressTime = 0.18,
+    time = { blue = 60, yellow = 45, pink = 30 },
+    finger = true, scroll = false,
     record = { n = 3, initials = true },
   },
 }

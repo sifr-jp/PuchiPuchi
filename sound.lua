@@ -309,4 +309,119 @@ function Sound.playPop(idx)
   end
 end
 
+---------------------------------------------------------------
+-- 早送りの「ジャッ」(Lv2-1 ローラー送りで1行潰したとき)
+-- シートが一気に引き出される音: 低めに絞ったノイズに、ローラーのラチェットのような細かい刻みを乗せる
+---------------------------------------------------------------
+local zipSources = nil
+
+local function makeZip(seed)
+  local rate = 44100
+  local dur = 0.16
+  local n = math.floor(rate * dur)
+  local sd = love.sound.newSoundData(n, rate, 16, 1)
+  local rng = love.math.newRandomGenerator(seed)
+  local lp = 0
+  for i = 0, n - 1 do
+    local t = i / rate
+    local f = 1 - t / dur                                  -- 0〜1(だんだん弱く)
+    local cutoff = 0.10 + 0.35 * f                         -- 最初は明るく、だんだんこもる
+    lp = lp + (rng:random() * 2 - 1 - lp) * cutoff
+    local tick = 0.55 + 0.45 * math.max(0, math.sin(2 * math.pi * 95 * t)) ^ 6   -- ラチェットの刻み
+    local env = math.min(1, t / 0.006) * f * f             -- 立ち上がり 6ms、すっと消える
+    sd:setSample(i, lp * tick * env * 0.9)
+  end
+  return love.audio.newSource(sd, "static")
+end
+
+function Sound.playZip()
+  if not zipSources then
+    zipSources = { makeZip(11), makeZip(23), makeZip(37) }
+  end
+  local s = zipSources[love.math.random(#zipSources)]:clone()
+  s:setPitch(0.92 + 0.16 * love.math.random())
+  s:setVolume(0.8)
+  s:play()
+end
+
+---------------------------------------------------------------
+-- 時間切れのブザー(Lv2-1)。少しずらした2つの矩形波がうなって「ブーッ」と鳴る
+---------------------------------------------------------------
+local function makeBuzzer()
+  local dur = 0.9
+  local n = math.floor(SAMPLE_RATE * dur)
+  local f1, f2 = 118, 124
+  local p1, p2, lp = 0, 0, 0
+  local buf = {}
+  for i = 0, n - 1 do
+    local t = i / SAMPLE_RATE
+    p1 = (p1 + f1 / SAMPLE_RATE) % 1
+    p2 = (p2 + f2 / SAMPLE_RATE) % 1
+    local sq = (p1 < 0.5 and 1 or -1) + (p2 < 0.45 and 1 or -1) * 0.8
+    lp = lp + 0.18 * (sq - lp)                                -- 角を少し丸めて耳に痛くない音に
+    local env = math.min(1, t / 0.01) * math.min(1, (dur - t) / 0.06)
+    buf[i] = lp * env
+  end
+  return toSource(buf, n, 0.75)
+end
+
+---------------------------------------------------------------
+-- 全部潰したときのファンファーレ(Lv2-1)。金管っぽい「パパパ・パーン、パ・パーーン」
+---------------------------------------------------------------
+local function makeFanfare()
+  -- { 周波数(Hz), 始まり(秒), 長さ(秒) }。最後は和音で伸ばす
+  local notes = {
+    { 392, 0.00, 0.11 }, { 392, 0.13, 0.11 }, { 392, 0.26, 0.11 }, { 523, 0.39, 0.42 },
+    { 440, 0.84, 0.13 }, { 523, 0.99, 0.13 },
+    { 659, 1.14, 1.05 }, { 523, 1.14, 1.05 }, { 784, 1.14, 1.05 },
+  }
+  local dur = 2.3
+  local n = math.floor(SAMPLE_RATE * dur)
+  local buf = {}
+  for i = 0, n - 1 do buf[i] = 0 end
+  for _, nt in ipairs(notes) do
+    local f, t0, len = nt[1], nt[2], nt[3]
+    local i0 = math.floor(t0 * SAMPLE_RATE)
+    local m = math.floor((len + 0.12) * SAMPLE_RATE)        -- 少し余韻を残す
+    local phase = 0
+    for j = 0, m - 1 do
+      local i = i0 + j
+      if i >= n then break end
+      local t = j / SAMPLE_RATE
+      local vib = 1 + 0.006 * math.sin(2 * pi * 5.5 * t) * math.min(1, t / 0.25)   -- 長い音にだけ揺れが付く
+      phase = phase + 2 * pi * f * vib / SAMPLE_RATE
+      local tone = 0
+      for h = 1, 6 do tone = tone + math.sin(phase * h) / h * (h == 1 and 1 or 0.8) end   -- 倍音で金管らしく
+      local env = math.min(1, t / 0.015)
+      if t > len then env = env * math.max(0, 1 - (t - len) / 0.12) end
+      env = env * (0.75 + 0.25 * math.exp(-t / 0.08))      -- 吹き始めを少し強く
+      buf[i] = buf[i] + tone * env
+    end
+  end
+  for i = 0, n - 1 do local d = buf[i] * 0.35 buf[i] = d / (1 + math.abs(d)) end   -- 和音が重なっても割れないように
+  return toSource(buf, n, 0.85)
+end
+
+local buzzerSrc, fanfareSrc = nil, nil
+
+-- ブザーとファンファーレを前もって作っておく(鳴らす瞬間に止まらないように、ステージに入るときに呼ぶ)
+function Sound.prepareJingles()
+  if not buzzerSrc then buzzerSrc = makeBuzzer() end
+  if not fanfareSrc then fanfareSrc = makeFanfare() end
+end
+
+function Sound.playBuzzer()
+  Sound.prepareJingles()
+  local s = buzzerSrc:clone()
+  s:setVolume(0.9)
+  s:play()
+end
+
+function Sound.playFanfare()
+  Sound.prepareJingles()
+  local s = fanfareSrc:clone()
+  s:setVolume(1.0)
+  s:play()
+end
+
 return Sound

@@ -21,6 +21,12 @@
 --   v1.5〜v1.7: 連打対応/BESTの丸の位置修正/指カーソルの潰れ・弾み・爪の色を調整
 --   v1.8: スマホ対応の第一歩。下部にMENU/RESETのタップボタン、イニシャル入力を上下矢印とOK/Skip
 --         ボタンに変更(物理キーボードが無くても遊べるように)。conf.luaにhighdpiを追加
+--   v2.0: Lv2-1 ローラー送り。メニューに Lv1/Lv2 の切り替えタブ(Tab キーでも切り替え)。
+--         記録の一覧は選んでいるレベルの分だけ表示。Lv2 では色が送り速度を決め、命中判定は Blue と同じ
+--   v2.1: Lv2-1 の開始時はシートを1段だけ見せる / TAP TO START ボタンで開始
+--   v2.2: Lv2-1 を制限時間制に(Blue 60秒 / Yellow 45秒 / Pink 30秒、180粒)。送りは一定速度で滑らかに
+--         (早送りは無くし、1行潰したときは音だけ)。時間切れでブザー、時間内に全部潰すとファンファーレと紙吹雪。
+--         上部中央は残り時間。記録は全部潰したときのタイムだけ。終了パネルのボタンは外し、下の MENU/RESET を使う
 
 local Sound = require("sound")
 local Records = require("records")
@@ -49,6 +55,14 @@ local SCROLL_KEY = 700          -- 矢印キー・W/Sのスクロール速度(px
 local EDGE_ZONE = 45            -- 押したまま上下の端へ動かすと自動スクロールする範囲(px)
 local EDGE_SPEED = 380          -- そのときのスクロール速度(px/秒)
 local FINISH_LOCK = 0.8         -- 全部潰した直後、この時間(秒)はクリックしてもリセットしない
+
+-- ローラー送り(Lv2-1)
+local ROLL_TOP_CY = 74          -- 上のローラー(繰り出し)の中心の高さ
+local ROLL_BOT_CY = 724         -- 下のローラー(巻き取り)の中心の高さ
+local ROLL_R_MIN, ROLL_R_MAX = 9, 22   -- ローラーの半径。巻いてあるシートの量で太さが変わる
+local ROLL_TOUCH_TOP = 98       -- ここより下から触れる(上のローラーの陰は触れない)
+local ROLL_TOUCH_BOT = 700      -- ここより上まで触れる。粒の中心がここを越えたら「取りこぼし」
+local CONFETTI_N = 140          -- 全部潰したときの紙吹雪の数
 
 ---------------------------------------------------------------
 -- 状態
@@ -87,11 +101,32 @@ local COLOR_RGB    = { blue = { 0.35, 0.60, 0.95 }, yellow = { 0.85, 0.68, 0.15 
 -- 指で狙うには小さすぎる大きさになってしまうため、最低限の大きさを保証する
 local COLOR_MINPX = { pink = 12 }
 local colorMode = "blue"                      -- メニューで選んだ命中判定の広さ(全ステージ共通)
+local menuLevel = 1                           -- メニューで表示しているレベル(1 / 2)
+local MAX_LEVEL = 2
+
+-- ローラー送りの状態
+--   start: 開始時の scrollY / speed: 送り速度(px/秒) / limit: 制限時間(秒) / missed: 取りこぼした粒の数
+--   rowLeft[r]: 行 r の潰していない粒の数 / phTop, phBot: 上下のローラーの回転角
+--   result: nil(遊んでいる) / "clear"(時間内に全部潰した) / "timeup"(時間切れ)
+--   confetti: 全部潰したときの紙吹雪
+local roll = { start = 0, speed = 30, limit = 60, missed = 0, rowLeft = {}, phTop = 0, phBot = 0,
+               result = nil, confetti = {}, clearAt = 0 }
+
+local function isRoller()
+  return stage ~= nil and stage.mode == "roller"
+end
+
+-- 色が命中判定の広さを決めるのは Lv1 だけ。Lv2 では色は速度などを決め、判定は Blue と同じ
+local function hitFactor()
+  if stage and stage.mode then return 1 end
+  return COLOR_FACTOR[colorMode] or 1
+end
 
 -- 命中判定の半径(px)。上の割合に加えて、PINKでは下限を適用する
 local function hitRadiusOf(b)
-  local r = b.rad * (COLOR_FACTOR[colorMode] or 1)
-  local minPx = COLOR_MINPX[colorMode]
+  local f = hitFactor()
+  local r = b.rad * f
+  local minPx = f < 1 and COLOR_MINPX[colorMode]
   if minPx and r < minPx then r = minPx end
   return r
 end
@@ -147,6 +182,13 @@ end
 local function playBottom()
   return view.h - BAR_H
 end
+
+-- シートが見える範囲(上端・下端)。ローラー送りでは上下のローラーの中心で切る
+local function clipTop() return isRoller() and ROLL_TOP_CY or HUD_H end
+local function clipBottom() return isRoller() and ROLL_BOT_CY or playBottom() end
+-- 粒に触れられる範囲(上端・下端)
+local function touchTop() return isRoller() and ROLL_TOUCH_TOP or HUD_H end
+local function touchBottom() return isRoller() and ROLL_TOUCH_BOT or playBottom() end
 
 ---------------------------------------------------------------
 -- シートの生成とレイアウト
@@ -261,6 +303,25 @@ local function newSheet()
   for _, b in ipairs(bubbles) do
     if not b.cut then total = total + 1 end
   end
+  if isRoller() then
+    -- ローラー送り: シートの先頭の1段だけが出たところで止まって待つ。
+    -- 「TAP TO START」か粒に触れたら送りが始まり、時間も計り始める
+    -- (先頭の段の中心を、触れられる範囲の上端から 0.35 粒下に置く。2段目は上のローラーに隠れる。
+    --  シートの下端は先頭の段の中心の 0.6 粒下)
+    maxScroll = 0
+    roll.start = sheet.y + sheet.h - (ROLL_TOUCH_TOP + 0.95 * cell)
+    scrollY = roll.start
+    -- 送りは一定の速さ。最後の段(いちばん上の行)の中心が、ちょうど制限時間で下端の線に着く速さにする
+    roll.limit = stage.time and stage.time[colorMode] or 60
+    local lastY = TOP + cell * 0.5 - roll.start             -- 最後の段の、開始時の画面上の高さ
+    roll.speed = (ROLL_TOUCH_BOT - lastY) / roll.limit
+    roll.missed, roll.result, roll.confetti = 0, nil, {}
+    roll.phTop, roll.phBot = 0, 0
+    roll.rowLeft = {}
+    for _, b in ipairs(bubbles) do
+      if not b.cut then roll.rowLeft[b.r] = (roll.rowLeft[b.r] or 0) + 1 end
+    end
+  end
 end
 
 -- (mx, wy): シート上の座標(スクロール分を足したもの)
@@ -276,9 +337,19 @@ local function hit(mx, wy)
     return nil                                     -- 切り落とされた部分は触れない
   end
   for _, b in ipairs(bubbles) do
-    local dx, dy = mx - b.x, wy - b.y
-    local hr = hitRadiusOf(b)
-    if dx * dx + dy * dy <= hr * hr then return b end
+    if not b.missed then                           -- 取りこぼした粒(ローラー送り)はもう触れない
+      local dx, dy = mx - b.x, wy - b.y
+      local hr = hitRadiusOf(b)
+      if dx * dx + dy * dy <= hr * hr then return b end
+    end
+  end
+end
+
+-- ローラー送り: 粒が片付いた(潰した or 取りこぼした)ときの行の数え直し
+local function rollerSettle(b, wasPopped)
+  roll.rowLeft[b.r] = roll.rowLeft[b.r] - 1
+  if wasPopped and roll.rowLeft[b.r] == 0 then        -- 1行まるごと潰した: 「ジャッ」と鳴らす(送りの速さは変えない)
+    if Sound.playZip then Sound.playZip() end
   end
 end
 
@@ -286,6 +357,7 @@ local function pop(b)
   b.popped, b.t = true, 0
   popped = popped + 1
   Sound.playPop(b.snd)
+  if isRoller() then rollerSettle(b, true) end
 end
 
 ---------------------------------------------------------------
@@ -320,10 +392,31 @@ local function colorSwatchHit(mx, my)
   end
 end
 
-local function menuHit(mx, my)
-  for i = 1, #STAGES do
-    local x, y, w, h = menuCard(i)
+-- メニュー上部の Lv1 / Lv2 の切り替えタブ
+local function levelTab(i)
+  return view.w / 2 - MAX_LEVEL * 55 + (i - 1) * 110 + 5, 106, 100, 32
+end
+
+local function levelTabHit(mx, my)
+  for i = 1, MAX_LEVEL do
+    local x, y, w, h = levelTab(i)
     if mx >= x and mx <= x + w and my >= y and my <= y + h then return i end
+  end
+end
+
+-- 表示中のレベルのステージ(STAGES の番号の一覧)
+local function levelStages()
+  local t = {}
+  for i, s in ipairs(STAGES) do
+    if (s.level or 1) == menuLevel then t[#t + 1] = i end
+  end
+  return t
+end
+
+local function menuHit(mx, my)
+  for k, idx in ipairs(levelStages()) do
+    local x, y, w, h = menuCard(k)
+    if mx >= x and mx <= x + w and my >= y and my <= y + h then return idx end
   end
 end
 
@@ -333,6 +426,7 @@ local function enterStage(i)
   updateView()
   fingerPress, fingerPressV = 0, 0
   Sound.setPitchScale(stage.soundPitch or 1)     -- 大粒は低く長く、小粒は高く短く
+  if stage.mode == "roller" and Sound.prepareJingles then Sound.prepareJingles() end   -- ブザーとファンファーレ
   newSheet()
   love.mouse.setVisible(not useFinger())          -- 指のカーソルを使うステージでは本物のカーソルを隠す
 end
@@ -420,6 +514,14 @@ local function pointIn(r, mx, my)
   return mx >= r.x and mx <= r.x + r.w and my >= r.y and my <= r.y + r.h
 end
 
+-- ローラー送りの開始ボタン(指でも押しやすい大きさ)
+local START_LABEL = "TAP TO START"
+local function startButtonRect()
+  local w = msgFont:getWidth(START_LABEL) + 80
+  local h = msgFont:getHeight() + 32
+  return { x = (view.w - w) / 2, y = 400, w = w, h = h }
+end
+
 
 function love.load()
   love.keyboard.setTextInput(false)     -- 日本語入力(IME)がキーを横取りしないようにする
@@ -450,6 +552,8 @@ function love.mousepressed(x, y, button)
     if button == 1 then
       local c = colorSwatchHit(mx, sy)
       if c then colorMode = c return end
+      local lv = levelTabHit(mx, sy)
+      if lv then menuLevel = lv return end
       local rx, ry, rw, rh = recordsButtonRect()
       if mx >= rx and mx <= rx + rw and sy >= ry and sy <= ry + rh then scene = "records" return end
       local qx, qy, qw, qh = quitButtonRect()
@@ -474,10 +578,14 @@ function love.mousepressed(x, y, button)
   if barTap == "menu" then exitToMenu() return end
   if barTap == "reset" then newSheet() return end
   if finished then
-    if love.timer.getTime() - finishAt > FINISH_LOCK then newSheet() end   -- 全部潰したらクリックで再挑戦
+    if love.timer.getTime() - finishAt > FINISH_LOCK then newSheet() end   -- 終わったらクリックで再挑戦
     return
   end
-  if sy < HUD_H then return end
+  if isRoller() and not timing and pointIn(startButtonRect(), mx, sy) then
+    timing = true                                       -- 開始ボタン: 送りと時間の計測を始める
+    return
+  end
+  if sy < touchTop() or sy > touchBottom() then return end
   local b = hit(mx, sy + scrollY)
   if b and not b.popped then
     b.press = b.press + rand(0.45, 0.75)              -- 素早いタップでも力が積み重なる(実機のタップに合わせて強めに)
@@ -509,8 +617,11 @@ function love.keypressed(key, scancode)
     if key == "b" then colorMode = "blue" end
     if key == "y" then colorMode = "yellow" end
     if key == "p" then colorMode = "pink" end
+    if key == "tab" or key == "right" then menuLevel = menuLevel % MAX_LEVEL + 1 end
+    if key == "left" then menuLevel = (menuLevel - 2) % MAX_LEVEL + 1 end
     local i = tonumber(key)
-    if i and STAGES[i] then enterStage(i) end
+    local list = levelStages()
+    if i and list[i] then enterStage(list[i]) end
     return
   end
   if entering then                                        -- イニシャル入力中
@@ -544,6 +655,82 @@ function love.keypressed(key, scancode)
   end
 end
 
+-- ローラーの太さ。巻いてあるシートの長さで変わる(面積は長さに比例するので半径は平方根で)
+local function rollerRadii()
+  local top = clamp(clipTop() - (sheet.y - scrollY), 0, sheet.h) / sheet.h
+  local bot = clamp((sheet.y + sheet.h - scrollY) - clipBottom(), 0, sheet.h) / sheet.h
+  local rTop = ROLL_R_MIN + (ROLL_R_MAX - ROLL_R_MIN) * math.sqrt(top)
+  local rBot = ROLL_R_MIN + (ROLL_R_MAX * 0.65 - ROLL_R_MIN) * math.sqrt(bot)   -- 潰れた分だけ細い
+  return rTop, rBot
+end
+
+-- 全部潰したときの紙吹雪
+local function spawnConfetti()
+  roll.confetti = {}
+  local cols = { { 0.35, 0.60, 0.95 }, { 0.95, 0.80, 0.25 }, { 0.92, 0.45, 0.65 }, { 0.45, 0.85, 0.55 }, { 1, 1, 1 } }
+  for i = 1, CONFETTI_N do
+    roll.confetti[i] = {
+      x = rand(0, view.w), y = rand(-view.h * 0.6, -10),
+      vx = rand(-40, 40), vy = rand(120, 260),
+      a = rand(0, 2 * pi), va = rand(-8, 8), w = rand(5, 10), h = rand(3, 6),
+      col = cols[love.math.random(#cols)], sway = rand(0, 2 * pi),
+    }
+  end
+end
+
+-- ローラー送り: シートを下へ送る(scrollY が減るほどシートは下へ動く)。
+-- 位置は経過時間から直接決めるので、1コマの長さがばらついても進み方は滑らか
+local function updateRoller(dt)
+  for _, c in ipairs(roll.confetti) do              -- 紙吹雪(終わったあとも動かす)
+    c.sway = c.sway + dt * 3
+    c.x = c.x + (c.vx + math.sin(c.sway) * 30) * dt
+    c.y = c.y + c.vy * dt
+    c.a = c.a + c.va * dt
+  end
+  if not timing or finished then return end
+  local prev = scrollY
+  -- elapsed はこのあと love.update の中で dt だけ進むので、進んだあとの時刻で位置を決める
+  scrollY = roll.start - roll.speed * math.min(elapsed + dt, roll.limit)
+  local d = prev - scrollY                          -- このコマで送った量(px)
+  local rTop, rBot = rollerRadii()                  -- ローラーの回転角は、送った量 ÷ 半径 を足していく
+  roll.phTop = roll.phTop + d / rTop
+  roll.phBot = roll.phBot + d / rBot
+  for _, b in ipairs(bubbles) do                     -- 下端を越えた粒は「取りこぼし」(失敗にはしない)
+    if not b.cut and not b.popped and not b.missed and b.y - scrollY > ROLL_TOUCH_BOT then
+      b.missed = true
+      roll.missed = roll.missed + 1
+      rollerSettle(b, false)
+    end
+  end
+end
+
+-- ステージの終わり。2つ目の戻り値が true のときは記録しない。
+-- ローラー送りは、時間内に全部潰したら「クリア」(ファンファーレ・記録あり)、
+-- 制限時間になったら「時間切れ」(ブザー・記録なし)。それ以外のステージは全部潰したら終わり
+local function stageDone()
+  if not isRoller() then return total > 0 and popped >= total, false end
+  if roll.result then return true, roll.result ~= "clear" end
+  if total > 0 and popped >= total then
+    roll.result = "clear"
+    roll.clearAt = love.timer.getTime()
+    spawnConfetti()
+    if Sound.playFanfare then Sound.playFanfare() end
+    return true, false
+  end
+  if elapsed >= roll.limit then
+    roll.result = "timeup"
+    elapsed = roll.limit
+    if Sound.playBuzzer then Sound.playBuzzer() end
+    return true, true
+  end
+  return false, false
+end
+
+-- 粒に触れられる高さか
+local function inTouch(sy)
+  return sy >= touchTop() and sy <= touchBottom()
+end
+
 function love.update(dt)
   if scene ~= "play" then return end
   local now = love.timer.getTime()
@@ -568,6 +755,9 @@ function love.update(dt)
     end
   end
   sy0 = sy
+
+  if isRoller() then updateRoller(dt) end
+
   local wy = sy + scrollY                          -- シート上の座標
 
   -- マウス移動速度(平滑化)。なぞりの速さで粒に入る力を変えるために使う
@@ -599,7 +789,7 @@ function love.update(dt)
   end
 
   local target
-  if down and sy >= HUD_H and not finished then target = hit(mx, wy) end
+  if down and inTouch(sy) and not finished then target = hit(mx, wy) end
   if target then timing = true end                            -- 最初に粒に触れたら計測開始
   if timing and not finished then elapsed = elapsed + dt end  -- 全部潰したら止まる
 
@@ -681,12 +871,13 @@ function love.update(dt)
     end
   end
 
-  -- 全部潰したら記録する(記録のあるステージだけ)
-  if not finished and total > 0 and popped >= total then
+  -- 終わったら記録する(記録のあるステージだけ。ローラー送りの時間切れは記録しない)
+  local done, noRecord = stageDone()
+  if not finished and done then
     finished = true
     finishAt = now
     local rec = stage.record
-    if rec then
+    if rec and not noRecord then
       if rec.initials then
         -- 上位に入ったら、イニシャルを入力してから記録する
         entryRank = Records.qualifies(recId(), elapsed, rec.n)
@@ -765,7 +956,7 @@ local function drawIntact(b)
 
   love.graphics.pop()
 
-  if COLOR_FACTOR[colorMode] < 1 then                           -- 触れないと反応しない範囲の目印
+  if hitFactor() < 1 then                                       -- 触れないと反応しない範囲の目印
     local rgb = COLOR_RGB[colorMode]
     love.graphics.setColor(rgb[1], rgb[2], rgb[3], 0.55)
     love.graphics.setLineWidth(1.5)
@@ -809,9 +1000,9 @@ end
 -- シートの矩形と、上部の表示エリアより下の範囲が重なる部分にシザーを設定する
 local function clipSheet()
   local x0 = math.max(sheet.x, 0)
-  local y0 = math.max(sheet.y - scrollY, HUD_H)
+  local y0 = math.max(sheet.y - scrollY, clipTop())
   local x1 = math.min(sheet.x + sheet.w, view.w)
-  local y1 = math.min(sheet.y + sheet.h - scrollY, playBottom())
+  local y1 = math.min(sheet.y + sheet.h - scrollY, clipBottom())
   if x1 <= x0 or y1 <= y0 then return false end
   setScissor(x0, y0, x1 - x0, y1 - y0)
   return true
@@ -929,6 +1120,11 @@ local function drawFinishPanel()
   local rec = stage.record
   local lh = msgFont:getHeight()
   local items = { { text = "All popped!  " .. fmtTime(elapsed) } }
+  if isRoller() and roll.result == "timeup" then               -- ローラー送りの時間切れ: 潰した数と割合
+    local rate = total > 0 and math.floor(popped / total * 100 + 0.5) or 0
+    items = { { text = "TIME UP!" },
+              { text = string.format("Popped %d / %d  (%d%%)", popped, total, rate) } }
+  end
   if rec and rec.n == 1 then                                    -- 最高記録だけ残すステージ
     local best = Records.best(recId())
     local text
@@ -951,7 +1147,7 @@ local function drawFinishPanel()
       }
     end
   end
-  items[#items + 1] = { text = "Click: retry   Esc: menu" }
+  items[#items + 1] = { text = "Tap: retry" }                  -- メニューへは下の MENU ボタンで戻る
 
   love.graphics.setFont(msgFont)
   local lw = 340
@@ -1036,9 +1232,108 @@ local function drawBar()
   love.graphics.printf("RESET", view.w / 2, by + (BAR_H - hudFont:getHeight()) / 2, view.w / 2, "center")
 end
 
+---------------------------------------------------------------
+-- 描画: ローラー送りの上下のローラー
+---------------------------------------------------------------
+-- 横向きの円筒を正面から見た形で描く。phase は回転角(シートの送り量 / 半径)。
+-- fresh = true: 上のローラー(まだ潰していない粒が巻いてある) / false: 下のローラー(潰れたシート)
+local function drawRoller(cy, r, phase, fresh)
+  local x0, w = sheet.x - 4, sheet.w + 8
+  -- 軸と、両端の支え
+  love.graphics.setColor(0.45, 0.52, 0.60, 0.9)
+  love.graphics.rectangle("fill", x0 - 14, cy - 3, w + 28, 6, 3, 3)
+  love.graphics.setColor(0.55, 0.62, 0.70, 1)
+  love.graphics.rectangle("fill", x0 - 18, cy - 9, 8, 18, 3, 3)
+  love.graphics.rectangle("fill", x0 + w + 10, cy - 9, 8, 18, 3, 3)
+  -- 本体: 帯を重ねて丸みの陰影を付ける(上が明るく、下が暗い)
+  local n = 12
+  for i = 0, n - 1 do
+    local a0 = -pi / 2 + pi * i / n
+    local a1 = -pi / 2 + pi * (i + 1) / n
+    local ya, yb = cy + r * math.sin(a0), cy + r * math.sin(a1)
+    local lit = 0.55 + 0.45 * math.cos((a0 + a1) / 2 + 0.5)
+    if fresh then
+      love.graphics.setColor(0.70 * lit + 0.25, 0.86 * lit + 0.12, 0.98, 0.85)
+    else
+      love.graphics.setColor(0.62 * lit + 0.25, 0.76 * lit + 0.15, 0.88, 0.85)
+    end
+    love.graphics.rectangle("fill", x0, ya, w, yb - ya + 0.5)
+  end
+  -- 表面の模様。回転に合わせて正面を上から下へ流れていく
+  local k = 10
+  for j = 0, k - 1 do
+    local a = (phase + j * 2 * pi / k) % (2 * pi) - pi          -- -pi〜pi(0 が正面)
+    local depth = math.cos(a)
+    if depth > 0.1 then
+      local y = cy + r * math.sin(a)
+      if fresh then                                              -- 巻いてある粒(つぶつぶ)
+        love.graphics.setColor(1, 1, 1, 0.55 * depth)
+        for c = 0, stage.cols - 1 do
+          local x = sheet.x + (c + 0.5 + (j % 2) * 0.5) * cell
+          if x < sheet.x + sheet.w then
+            love.graphics.ellipse("fill", x, y, cell * 0.30, cell * 0.30 * depth * (r / ROLL_R_MAX))
+          end
+        end
+      else                                                       -- 潰れたシートのしわ
+        love.graphics.setColor(0.35, 0.5, 0.7, 0.35 * depth)
+        love.graphics.setLineWidth(1.5)
+        love.graphics.line(x0 + 6, y, x0 + w - 6, y + (j % 3 - 1) * 1.5)
+      end
+    end
+  end
+  -- 縁取りと光沢
+  love.graphics.setColor(0.5, 0.75, 0.95, 0.9)
+  love.graphics.setLineWidth(1.5)
+  love.graphics.rectangle("line", x0, cy - r, w, 2 * r, 4, 4)
+  love.graphics.setColor(1, 1, 1, 0.45)
+  love.graphics.rectangle("fill", x0 + 4, cy - r * 0.62, w - 8, math.max(2, r * 0.18), 2, 2)
+end
+
+-- 全部潰したときのお祝い: 紙吹雪と「PERFECT!」の文字
+local function drawCelebration()
+  for _, c in ipairs(roll.confetti) do
+    if c.y < view.h + 20 then
+      love.graphics.push()
+      love.graphics.translate(c.x, c.y)
+      love.graphics.rotate(c.a)
+      love.graphics.setColor(c.col[1], c.col[2], c.col[3], 0.95)
+      love.graphics.rectangle("fill", -c.w / 2, -c.h / 2, c.w, c.h * math.abs(math.cos(c.a * 1.7)) + 1)
+      love.graphics.pop()
+    end
+  end
+  local t = love.timer.getTime() - roll.clearAt
+  local k = 1 + 0.08 * math.sin(t * 6) + 0.6 * math.max(0, 1 - t / 0.35)   -- 最初にポンと大きく出て、あとは脈打つ
+  love.graphics.setFont(titleFont)
+  local text = "PERFECT!"
+  local tw, th = titleFont:getWidth(text), titleFont:getHeight()
+  love.graphics.push()
+  love.graphics.translate(view.w / 2, HUD_H + 70)
+  love.graphics.scale(k)
+  love.graphics.setColor(0.2, 0.3, 0.45, 0.35)                                   -- 影
+  love.graphics.print(text, -tw / 2 + 3, -th / 2 + 3)
+  local hue = t * 2
+  love.graphics.setColor(0.95, 0.55 + 0.25 * math.sin(hue), 0.35 + 0.3 * math.sin(hue + 2), 1)
+  love.graphics.print(text, -tw / 2, -th / 2)
+  love.graphics.pop()
+  love.graphics.setFont(msgFont)
+  love.graphics.setColor(0.2, 0.3, 0.4)
+  love.graphics.printf("Congratulations!", 0, HUD_H + 70 + th * 0.6, view.w, "center")
+end
+
+local function drawRollers()
+  local rTop, rBot = rollerRadii()
+  -- 上のローラーの下に落ちる薄い影
+  for i = 0, 7 do
+    love.graphics.setColor(0.1, 0.2, 0.3, 0.10 * (1 - i / 8))
+    love.graphics.rectangle("fill", sheet.x, ROLL_TOP_CY + rTop + i, sheet.w, 1)
+  end
+  drawRoller(ROLL_TOP_CY, rTop, roll.phTop, true)
+  drawRoller(ROLL_BOT_CY, rBot, roll.phBot, false)
+end
+
 local function drawPlay()
   -- シート(スクロールする層)
-  setScissor(0, HUD_H, view.w, playBottom() - HUD_H)
+  setScissor(0, clipTop(), view.w, clipBottom() - clipTop())
   love.graphics.push()
   love.graphics.translate(0, -scrollY)
   drawSheet()
@@ -1050,12 +1345,13 @@ local function drawPlay()
     end
   end
   drawFilm()
-  setScissor(0, HUD_H, view.w, playBottom() - HUD_H)
+  setScissor(0, clipTop(), view.w, clipBottom() - clipTop())
   drawCutEdges()
   love.graphics.pop()
   love.graphics.setScissor()
+  if isRoller() then drawRollers() end
 
-  if scrollY > 1 then                                            -- 上部の表示エリアの下に薄い影
+  if scrollY > 1 and not isRoller() then                         -- 上部の表示エリアの下に薄い影
     for i = 0, 7 do
       love.graphics.setColor(0.1, 0.2, 0.3, 0.10 * (1 - i / 8))
       love.graphics.rectangle("fill", 0, HUD_H + i, view.w, 1)
@@ -1069,7 +1365,8 @@ local function drawPlay()
   love.graphics.circle("fill", 22, 27, 6)
   love.graphics.setColor(0.2, 0.3, 0.4)
   love.graphics.print(string.format("%d / %d", popped, total), 36, 18)
-  love.graphics.printf(fmtTime(elapsed), 0, 18, view.w, "center")
+  local shown = isRoller() and math.max(0, roll.limit - elapsed) or elapsed   -- ローラー送りは残り時間
+  love.graphics.printf(fmtTime(shown), 0, 18, view.w, "center")
   if stage.record then
     local best = Records.best(recId())
     love.graphics.printf("BEST " .. (best and fmtTime(best) or "--"), 0, 18, view.w - 16, "right")
@@ -1078,7 +1375,19 @@ local function drawPlay()
   end
 
   drawScrollbar()
+  if isRoller() and not timing and not finished then            -- 開始ボタンか粒に触れるまでシートは止まって待つ
+    love.graphics.setFont(msgFont)
+    local r = startButtonRect()
+    love.graphics.setColor(0.35, 0.65, 0.95, 1)
+    love.graphics.rectangle("fill", r.x, r.y, r.w, r.h, 14, 14)
+    love.graphics.setColor(0.25, 0.45, 0.7, 0.8)
+    love.graphics.setLineWidth(1.5)
+    love.graphics.rectangle("line", r.x, r.y, r.w, r.h, 14, 14)
+    love.graphics.setColor(1, 1, 1)
+    love.graphics.printf(START_LABEL, r.x, r.y + (r.h - msgFont:getHeight()) / 2, r.w, "center")
+  end
   if not entering then drawBar() end                              -- 入力中はうっかり押さないよう隠す
+  if isRoller() and roll.result == "clear" then drawCelebration() end
   if entering then drawEntryPanel() elseif finished then drawFinishPanel() end
 
   if useFinger() then                                            -- 指のカーソル(いちばん手前)
@@ -1093,9 +1402,22 @@ local function drawMenu()
   love.graphics.printf("PUCHIPUCHI", 0, 60, view.w, "center")
   love.graphics.setFont(hudFont)
   love.graphics.setColor(0.35, 0.45, 0.55)
-  love.graphics.printf("Level 1", 0, 118, view.w, "center")
-  love.graphics.printf("Hit area: " .. COLOR_LABEL[colorMode] .. "  (" .. COLOR_DIFF[colorMode] .. ")",
-                       0, 142, view.w, "center")
+  for i = 1, MAX_LEVEL do                                         -- Lv1 / Lv2 の切り替えタブ
+    local x, y, w, h = levelTab(i)
+    local on = i == menuLevel
+    love.graphics.setColor(1, 1, 1, on and 0.95 or 0.45)
+    love.graphics.rectangle("fill", x, y, w, h, 10, 10)
+    love.graphics.setColor(0.5, 0.75, 0.95, on and 1 or 0.5)
+    love.graphics.setLineWidth(on and 2.5 or 1.5)
+    love.graphics.rectangle("line", x, y, w, h, 10, 10)
+    love.graphics.setColor(0.2, 0.3, 0.4, on and 1 or 0.5)
+    love.graphics.printf("Level " .. i, x, y + (h - hudFont:getHeight()) / 2, w, "center")
+  end
+  love.graphics.setColor(0.35, 0.45, 0.55)
+  -- Lv1 では色は命中判定の広さ、Lv2 ではステージごとの難しさ(速度など)
+  local what = menuLevel == 1 and "Hit area: " or "Difficulty: "
+  love.graphics.printf(what .. COLOR_LABEL[colorMode] .. "  (" .. COLOR_DIFF[colorMode] .. ")",
+                       0, 146, view.w, "center")
 
   for i, name in ipairs(COLOR_MODES) do                          -- 命中判定の広さの選択
     local cx, cy, r = colorSwatch(i)
@@ -1112,7 +1434,9 @@ local function drawMenu()
   love.graphics.setFont(hudFont)
 
   local mx, my = mousePos()
-  for i, s in ipairs(STAGES) do
+  local list = levelStages()
+  for i, idx in ipairs(list) do
+    local s = STAGES[idx]
     local x, y, w, h = menuCard(i)
     local over = mx >= x and mx <= x + w and my >= y and my <= y + h
     love.graphics.setColor(1, 1, 1, over and 0.80 or 0.50)
@@ -1159,14 +1483,14 @@ local function drawMenu()
   love.graphics.printf("QUIT", qx, qy + (qh - hudFont:getHeight()) / 2, qw, "center")
 
   love.graphics.setColor(0.45, 0.55, 0.65)
-  love.graphics.printf("Press 1-" .. #STAGES .. " or tap a stage", 0, 758, view.w, "center")
+  love.graphics.printf("Press 1-" .. #list .. " or tap a stage   Tab: level", 0, 758, view.w, "center")
 end
 
 -- 記録は色ごとに分かれているので、Blue/Yellow/Pinkを3列に並べて表示する
 local function drawRecords()
   love.graphics.setColor(0.2, 0.3, 0.4)
   love.graphics.setFont(titleFont)
-  love.graphics.printf("RECORDS", 0, 40, view.w, "center")
+  love.graphics.printf("RECORDS  Lv" .. menuLevel, 0, 40, view.w, "center")
 
   local left = 40
   local colW = (view.w - 2 * left) / 3
@@ -1174,7 +1498,7 @@ local function drawRecords()
   local y = 108
 
   for _, s in ipairs(STAGES) do
-    if s.record then
+    if s.record and (s.level or 1) == menuLevel then             -- メニューで選んでいるレベルの分だけ
       love.graphics.setFont(msgFont)
       love.graphics.setColor(0.2, 0.3, 0.4)
       love.graphics.print(s.title, left, y)
