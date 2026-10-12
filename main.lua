@@ -27,6 +27,11 @@
 --   v2.2: Lv2-1 を制限時間制に(Blue 60秒 / Yellow 45秒 / Pink 30秒、180粒)。送りは一定速度で滑らかに
 --         (早送りは無くし、1行潰したときは音だけ)。時間切れでブザー、時間内に全部潰すとファンファーレと紙吹雪。
 --         上部中央は残り時間。記録は全部潰したときのタイムだけ。終了パネルのボタンは外し、下の MENU/RESET を使う
+--   v2.3: Lv2-2 エンドレスロール。制限時間(Blue 60秒 / Yellow 90秒 / Pink 120秒)のあいだ、だんだん速くなるシートを潰す。
+--         続けて潰すとコンボの文字と破裂音の音程アップ。記録は潰した個数(多い順)。自己ベスト更新でファンファーレ
+--   v2.4: Lv2-2 を Lv2-1 とはっきり違う手触りに。粒は軽く触れるだけで潰れ、虹色のシートと暖かい背景。
+--         潰れ方は4種類(輪・火花・もや・星)で、星は「キラッ」も鳴る。50個ごとに「50 POPS!」と
+--         ジングルと紙吹雪(100個ごとは金色で大きく)
 
 local Sound = require("sound")
 local Records = require("records")
@@ -63,6 +68,9 @@ local ROLL_R_MIN, ROLL_R_MAX = 9, 22   -- ローラーの半径。巻いてあ�
 local ROLL_TOUCH_TOP = 98       -- ここより下から触れる(上のローラーの陰は触れない)
 local ROLL_TOUCH_BOT = 700      -- ここより上まで触れる。粒の中心がここを越えたら「取りこぼし」
 local CONFETTI_N = 140          -- 全部潰したときの紙吹雪の数
+local COMBO_GAP = 0.9           -- エンドレスロール: この時間(秒)以内に次を潰すとコンボが続く
+local COMBO_SHOW = 0.8          -- コンボの文字が浮かんで消えるまでの時間(秒)
+local MILESTONE_SHOW = 1.6      -- 「50 POPS!」などの達成表示が出ている時間(秒)
 
 ---------------------------------------------------------------
 -- 状態
@@ -108,12 +116,39 @@ local MAX_LEVEL = 2
 --   start: 開始時の scrollY / speed: 送り速度(px/秒) / limit: 制限時間(秒) / missed: 取りこぼした粒の数
 --   rowLeft[r]: 行 r の潰していない粒の数 / phTop, phBot: 上下のローラーの回転角
 --   result: nil(遊んでいる) / "clear"(時間内に全部潰した) / "timeup"(時間切れ)
---   confetti: 全部潰したときの紙吹雪
+--   confetti: 全部潰したときの紙吹雪 / celebrate: お祝いの文字({ title, sub })
+--   エンドレスロール(Lv2-2)だけで使うもの:
+--   v0, v1: 始めと終わりの送り速度(px/秒) / combo, maxCombo, comboAt: コンボの数・最大・最後に潰した時刻
+--   comboFx: 浮かぶコンボの文字 { x, y, t, n } / milestone: 達成表示 { n, t, big }
 local roll = { start = 0, speed = 30, limit = 60, missed = 0, rowLeft = {}, phTop = 0, phBot = 0,
-               result = nil, confetti = {}, clearAt = 0 }
+               result = nil, confetti = {}, clearAt = 0, celebrate = nil,
+               v0 = 20, v1 = 40, combo = 0, maxCombo = 0, comboAt = -10, comboFx = nil, milestone = nil }
 
+-- ローラーのあるステージ(Lv2-1 ローラー送り / Lv2-2 エンドレスロール)
 local function isRoller()
-  return stage ~= nil and stage.mode == "roller"
+  return stage ~= nil and (stage.mode == "roller" or stage.mode == "endless")
+end
+
+local function isEndless()
+  return stage ~= nil and stage.mode == "endless"
+end
+
+-- 送り始めてから t 秒で送った量(px)。エンドレスロールは速さが v0 から v1 へ一定の割合で上がる
+local function rollDistance(t)
+  if isEndless() then
+    return roll.v0 * t + (roll.v1 - roll.v0) * t * t / (2 * roll.limit)
+  end
+  return roll.speed * t
+end
+
+-- 記録する値: エンドレスロールは潰した個数(多いほど上)、それ以外はタイム(短いほど上)
+local function isScoreStage(s)
+  return s and s.record and s.record.score
+end
+
+local function recordValue()
+  if isScoreStage(stage) then return popped end
+  return elapsed
 end
 
 -- 色が命中判定の広さを決めるのは Lv1 だけ。Lv2 では色は速度などを決め、判定は Blue と同じ
@@ -135,6 +170,17 @@ local function rand(a, b) return a + (b - a) * love.math.random() end
 local function later(delay, fn) pending[#pending + 1] = { t = delay, fn = fn } end
 local function clamp(v, a, b) return math.max(a, math.min(b, v)) end
 
+-- 色相 h(0〜1)・彩度 sat・明るさ v から RGB を作る(エンドレスロールの虹色のシート用)
+local function hsv(h, sat, v)
+  local i = math.floor(h * 6) % 6
+  local f = h * 6 - math.floor(h * 6)
+  local p, q, t = v * (1 - sat), v * (1 - f * sat), v * (1 - (1 - f) * sat)
+  if i == 0 then return { v, t, p } elseif i == 1 then return { q, v, p }
+  elseif i == 2 then return { p, v, t } elseif i == 3 then return { p, q, v }
+  elseif i == 4 then return { t, p, v } end
+  return { v, p, q }
+end
+
 local function useFinger()
   local os_ = love.system.getOS()
   return stage ~= nil and stage.finger and os_ ~= "Android" and os_ ~= "iOS"
@@ -144,6 +190,13 @@ end
 local function fmtTime(sec)
   local cs = math.floor(sec * 100)                 -- 1/100秒単位の整数
   return string.format("%d:%02d.%02d", math.floor(cs / 6000), math.floor(cs / 100) % 60, cs % 100)
+end
+
+-- 記録の表示。個数のステージは整数、それ以外は時間
+local function fmtRecord(s, v)
+  if not v then return "--" end
+  if isScoreStage(s) then return tostring(math.floor(v + 0.5)) end
+  return fmtTime(v)
 end
 
 ---------------------------------------------------------------
@@ -199,6 +252,11 @@ local function calcRows()
     -- 下端に少しでも見える行まで作る。下端にかかる行は半割になる
     local y1 = playBottom() - MARGIN
     rows = math.max(1, math.ceil((y1 - TOP - 0.19 * cell) / (cell * 0.87)))
+  elseif stage.mode == "endless" then
+    -- エンドレスロール: 制限時間のあいだに送る量より長いシートを作っておく(画面1枚分の余裕を足す)
+    local t = stage.time[colorMode]
+    local dist = (stage.speedFrom[colorMode] + stage.speedTo[colorMode]) / 2 * t
+    rows = math.ceil((dist + view.h) / (cell * 0.87)) + 2
   else
     rows = stage.rows
   end
@@ -259,8 +317,8 @@ local function newSheet()
       local b = {
         c = c, r = r,
         press = 0,
-        -- 粒ごとの「潰れにくさ」。伸びる粒は素早いなぞりでは潰れない
-        thresh = hard and rand(1.2, 1.8) or rand(0.6, 1.1),
+        -- 粒ごとの「潰れにくさ」。伸びる粒は素早いなぞりでは潰れない。softPop のステージは軽く触れるだけで潰れる
+        thresh = hard and rand(1.2, 1.8) or (stage.softPop and rand(0.30, 0.50) or rand(0.6, 1.1)),
         hard = hard,
         speed = rand(0.7, 1.3),                    -- 粒ごとの押し込み速度の個体差
         seed = rand(0, 100),                       -- 押し込み速度の時間変化用
@@ -273,6 +331,10 @@ local function newSheet()
         tint = rand(-0.03, 0.03),                  -- 色味の個体差
         hx = rand(-0.35, 0.35), hy = rand(-0.35, 0.35),  -- 破裂後の穴の位置
         wr = {},                                   -- 破裂後のしわ(少なめ・太め・柔らかく)
+        -- 潰れ方の種類(popFx のステージだけ): 1=輪 2=火花 3=空気のもや 4=星
+        fx = stage.popFx and love.math.random(4) or 1,
+        -- 虹色のシート(rainbow のステージだけ): 行ごとに色相を少しずつずらす
+        col = stage.rainbow and hsv((r * 0.045 + c * 0.012) % 1, 0.42, 1) or nil,
       }
       for i = 1, 5 do
         local a, d = rand(0, 2 * pi), rand(0.1, 0.7)
@@ -311,11 +373,16 @@ local function newSheet()
     maxScroll = 0
     roll.start = sheet.y + sheet.h - (ROLL_TOUCH_TOP + 0.95 * cell)
     scrollY = roll.start
-    -- 送りは一定の速さ。最後の段(いちばん上の行)の中心が、ちょうど制限時間で下端の線に着く速さにする
+    -- ローラー送り: 送りは一定の速さ。最後の段(いちばん上の行)の中心が、ちょうど制限時間で下端の線に着く速さ
+    -- エンドレスロール: 速さは stages.lua の speedFrom から speedTo へ、時間とともに上がる
     roll.limit = stage.time and stage.time[colorMode] or 60
     local lastY = TOP + cell * 0.5 - roll.start             -- 最後の段の、開始時の画面上の高さ
     roll.speed = (ROLL_TOUCH_BOT - lastY) / roll.limit
-    roll.missed, roll.result, roll.confetti = 0, nil, {}
+    if stage.mode == "endless" then
+      roll.v0, roll.v1 = stage.speedFrom[colorMode], stage.speedTo[colorMode]
+    end
+    roll.combo, roll.maxCombo, roll.comboAt, roll.comboFx, roll.milestone = 0, 0, -10, nil, nil
+    roll.missed, roll.result, roll.confetti, roll.celebrate = 0, nil, {}, nil
     roll.phTop, roll.phBot = 0, 0
     roll.rowLeft = {}
     for _, b in ipairs(bubbles) do
@@ -353,10 +420,37 @@ local function rollerSettle(b, wasPopped)
   end
 end
 
+-- エンドレスロール: 続けて潰すとコンボが増え、破裂音が半音ずつ高くなる(1オクターブまで)
+local function addCombo(b)
+  local now = love.timer.getTime()
+  if now - roll.comboAt <= COMBO_GAP then roll.combo = roll.combo + 1 else roll.combo = 1 end
+  roll.comboAt = now
+  if roll.combo > roll.maxCombo then roll.maxCombo = roll.combo end
+  if roll.combo >= 2 then roll.comboFx = { x = b.x, y = b.y, t = now, n = roll.combo } end
+  return 0.9 * 2 ^ (math.min(roll.combo - 1, 12) / 12)
+end
+
+-- 全部潰したときの紙吹雪(spawnConfetti)は下で定義する。達成表示からも使うので先に名前だけ用意する
+local spawnConfetti
+
+-- エンドレスロール: 潰した粒の音のおまけと、50個ごとの達成表示(100個ごとは大きく)
+local function endlessPop(b, pitch)
+  if b.fx == 4 and Sound.playChime then Sound.playChime(pitch) end   -- 星の潰れ方は「キラッ」も鳴る(4粒に1粒くらい)
+  local every = stage.milestone
+  if every and popped % every == 0 then
+    local big = popped % (every * 2) == 0
+    roll.milestone = { n = popped, t = love.timer.getTime(), big = big }
+    spawnConfetti(big and 90 or 45)
+    if Sound.playMilestone then Sound.playMilestone(big) end
+  end
+end
+
 local function pop(b)
   b.popped, b.t = true, 0
   popped = popped + 1
-  Sound.playPop(b.snd)
+  local pitch = isEndless() and addCombo(b) or nil
+  Sound.playPop(b.snd, pitch)
+  if isEndless() then endlessPop(b, pitch) end
   if isRoller() then rollerSettle(b, true) end
 end
 
@@ -426,7 +520,7 @@ local function enterStage(i)
   updateView()
   fingerPress, fingerPressV = 0, 0
   Sound.setPitchScale(stage.soundPitch or 1)     -- 大粒は低く長く、小粒は高く短く
-  if stage.mode == "roller" and Sound.prepareJingles then Sound.prepareJingles() end   -- ブザーとファンファーレ
+  if stage.mode and Sound.prepareJingles then Sound.prepareJingles() end   -- ブザーとファンファーレ
   newSheet()
   love.mouse.setVisible(not useFinger())          -- 指のカーソルを使うステージでは本物のカーソルを隠す
 end
@@ -463,7 +557,7 @@ end
 
 -- イニシャルを確定して記録する
 local function confirmEntry()
-  local rank = Records.add(recId(), elapsed, stage.record.n, initials, colorMode)
+  local rank = Records.add(recId(), recordValue(), stage.record.n, initials, colorMode, stage.record.score)
   lastInitials = initials
   entering = false
   finishInfo = { rank = rank }
@@ -664,12 +758,16 @@ local function rollerRadii()
   return rTop, rBot
 end
 
--- 全部潰したときの紙吹雪
-local function spawnConfetti()
-  roll.confetti = {}
+-- 全部潰したときの紙吹雪(n: 枚数。省略時は CONFETTI_N)。前の紙吹雪が残っていればそこに足す
+spawnConfetti = function(n)
+  local list = {}
+  for _, c in ipairs(roll.confetti) do
+    if c.y < view.h + 20 then list[#list + 1] = c end
+  end
+  roll.confetti = list
   local cols = { { 0.35, 0.60, 0.95 }, { 0.95, 0.80, 0.25 }, { 0.92, 0.45, 0.65 }, { 0.45, 0.85, 0.55 }, { 1, 1, 1 } }
-  for i = 1, CONFETTI_N do
-    roll.confetti[i] = {
+  for i = 1, n or CONFETTI_N do
+    roll.confetti[#roll.confetti + 1] = {
       x = rand(0, view.w), y = rand(-view.h * 0.6, -10),
       vx = rand(-40, 40), vy = rand(120, 260),
       a = rand(0, 2 * pi), va = rand(-8, 8), w = rand(5, 10), h = rand(3, 6),
@@ -690,7 +788,7 @@ local function updateRoller(dt)
   if not timing or finished then return end
   local prev = scrollY
   -- elapsed はこのあと love.update の中で dt だけ進むので、進んだあとの時刻で位置を決める
-  scrollY = roll.start - roll.speed * math.min(elapsed + dt, roll.limit)
+  scrollY = roll.start - rollDistance(math.min(elapsed + dt, roll.limit))
   local d = prev - scrollY                          -- このコマで送った量(px)
   local rTop, rBot = rollerRadii()                  -- ローラーの回転角は、送った量 ÷ 半径 を足していく
   roll.phTop = roll.phTop + d / rTop
@@ -709,10 +807,27 @@ end
 -- 制限時間になったら「時間切れ」(ブザー・記録なし)。それ以外のステージは全部潰したら終わり
 local function stageDone()
   if not isRoller() then return total > 0 and popped >= total, false end
-  if roll.result then return true, roll.result ~= "clear" end
+  if roll.result then return true, roll.result == "timeup" end
+  if isEndless() then
+    -- エンドレスロール: 制限時間で終わり、潰した個数を記録する。自己ベストを超えたらお祝い
+    if elapsed < roll.limit then return false, false end
+    elapsed = roll.limit
+    roll.result = "end"
+    local best = Records.best(recId())
+    if popped > 0 and (not best or popped > best) then
+      roll.clearAt = love.timer.getTime()
+      roll.celebrate = { title = "NEW RECORD!", sub = popped .. " pops!" }
+      spawnConfetti()
+      if Sound.playFanfare then Sound.playFanfare() end
+    elseif Sound.playBuzzer then
+      Sound.playBuzzer()
+    end
+    return true, false
+  end
   if total > 0 and popped >= total then
     roll.result = "clear"
     roll.clearAt = love.timer.getTime()
+    roll.celebrate = { title = "PERFECT!", sub = "Congratulations!" }
     spawnConfetti()
     if Sound.playFanfare then Sound.playFanfare() end
     return true, false
@@ -880,7 +995,7 @@ function love.update(dt)
     if rec and not noRecord then
       if rec.initials then
         -- 上位に入ったら、イニシャルを入力してから記録する
-        entryRank = Records.qualifies(recId(), elapsed, rec.n)
+        entryRank = Records.qualifies(recId(), recordValue(), rec.n, rec.score)
         if entryRank then
           entering, initials, entrySlot = true, padInitials(lastInitials), 1
         else
@@ -888,7 +1003,7 @@ function love.update(dt)
         end
       else
         local prev = Records.best(recId())
-        local rank = Records.add(recId(), elapsed, rec.n, nil, colorMode)
+        local rank = Records.add(recId(), recordValue(), rec.n, nil, colorMode, rec.score)
         finishInfo = { prev = prev, rank = rank }
       end
     end
@@ -921,6 +1036,10 @@ local function drawIntact(b)
   love.graphics.circle("fill", r * 0.12, r * 0.18, r)
   love.graphics.setColor(0.75 + tn, 0.9 + tn, 1, 0.30 + 0.10 * p)  -- 本体(張るほど濃く)
   love.graphics.circle("fill", 0, 0, r)
+  if b.col then                                                 -- 虹色のシートの色
+    love.graphics.setColor(b.col[1], b.col[2], b.col[3], 0.42 + 0.15 * p)
+    love.graphics.circle("fill", 0, 0, r)
+  end
   if b.cut then                                                 -- 切り開かれたドームの内側
     love.graphics.setColor(0.35, 0.55, 0.8, 0.10)
     love.graphics.circle("fill", 0, 0, r * 0.92)
@@ -969,6 +1088,10 @@ local function drawPopped(b)
   local r = b.rad * (1 - 0.20 * k)                              -- 潰れた直後、もう少し大きく縮む
   love.graphics.setColor(0.72, 0.84, 0.92, 0.5)                 -- しぼんだ円盤
   love.graphics.circle("fill", b.x, b.y, r)
+  if b.col then                                                 -- 虹色のシートは潰れても淡く色が残る
+    love.graphics.setColor(b.col[1], b.col[2], b.col[3], 0.25)
+    love.graphics.circle("fill", b.x, b.y, r)
+  end
   love.graphics.setColor(0.5, 0.65, 0.8, 0.5)
   love.graphics.setLineWidth(1)
   love.graphics.circle("line", b.x, b.y, r)
@@ -982,7 +1105,37 @@ local function drawPopped(b)
   end
   love.graphics.setColor(0.3, 0.45, 0.6, 0.45)                  -- 破れた小さな穴
   love.graphics.ellipse("fill", b.x + b.hx * r, b.y + b.hy * r, r * 0.07, r * 0.045)
-  if b.t < 0.32 then                                            -- 破裂の一瞬の演出(もう少し大きく・長く)
+  if b.fx == 2 and b.t < 0.30 then                              -- 火花: 放射状に飛ぶ短い線
+    local q = b.t / 0.30
+    love.graphics.setLineWidth(2.5)
+    for i = 1, 8 do
+      local a = b.seed + i * pi / 4
+      local d0, d1 = b.rad * (0.6 + 1.2 * q), b.rad * (0.9 + 1.6 * q)
+      love.graphics.setColor(1, 0.92, 0.55, 1 - q)
+      love.graphics.line(b.x + math.cos(a) * d0, b.y + math.sin(a) * d0, b.x + math.cos(a) * d1, b.y + math.sin(a) * d1)
+    end
+  elseif b.fx == 3 and b.t < 0.45 then                          -- 空気のもや: 小さな粒がふわっと広がる
+    local q = b.t / 0.45
+    for i = 1, 7 do
+      local a = b.seed * 3 + i * 2 * pi / 7
+      local d = b.rad * (0.3 + 1.3 * q)
+      love.graphics.setColor(1, 1, 1, 0.75 * (1 - q))
+      love.graphics.circle("fill", b.x + math.cos(a) * d, b.y + math.sin(a) * d - 10 * q, b.rad * (0.22 - 0.12 * q))
+    end
+  elseif b.fx == 4 and b.t < 0.35 then                          -- 星: 回りながら縮むキラッとした光
+    local q = b.t / 0.35
+    local rr = b.rad * (1.5 - 0.9 * q)
+    local rot = b.seed + q * 2
+    local pts = {}
+    for i = 0, 9 do
+      local a = rot + i * pi / 5
+      local d = (i % 2 == 0) and rr or rr * 0.42
+      pts[#pts + 1] = b.x + math.cos(a) * d
+      pts[#pts + 1] = b.y + math.sin(a) * d
+    end
+    love.graphics.setColor(1, 0.95, 0.6, 0.9 * (1 - q))
+    love.graphics.polygon("fill", pts)
+  elseif b.t < 0.32 then                                        -- 破裂の一瞬の演出(もう少し大きく・長く)
     local q = b.t / 0.32
     love.graphics.setColor(1, 1, 1, 0.95 * (1 - q))
     love.graphics.setLineWidth(3)
@@ -1120,7 +1273,10 @@ local function drawFinishPanel()
   local rec = stage.record
   local lh = msgFont:getHeight()
   local items = { { text = "All popped!  " .. fmtTime(elapsed) } }
-  if isRoller() and roll.result == "timeup" then               -- ローラー送りの時間切れ: 潰した数と割合
+  if isEndless() then                                           -- エンドレスロール: 潰した個数と最大コンボ
+    items = { { text = "TIME UP!" },
+              { text = string.format("Popped %d   Max combo %d", popped, roll.maxCombo) } }
+  elseif isRoller() and roll.result == "timeup" then           -- ローラー送りの時間切れ: 潰した数と割合
     local rate = total > 0 and math.floor(popped / total * 100 + 0.5) or 0
     items = { { text = "TIME UP!" },
               { text = string.format("Popped %d / %d  (%d%%)", popped, total, rate) } }
@@ -1129,9 +1285,9 @@ local function drawFinishPanel()
     local best = Records.best(recId())
     local text
     if finishInfo and finishInfo.rank == 1 then
-      text = finishInfo.prev and ("NEW RECORD!  (prev " .. fmtTime(finishInfo.prev) .. ")") or "NEW RECORD!"
+      text = finishInfo.prev and ("NEW RECORD!  (prev " .. fmtRecord(stage, finishInfo.prev) .. ")") or "NEW RECORD!"
     else
-      text = "BEST  " .. (best and fmtTime(best) or "--")
+      text = "BEST  " .. fmtRecord(stage, best)
     end
     items[#items + 1] = { text = text }
   elseif rec then                                               -- 上位を残すステージ: 順位表
@@ -1141,7 +1297,7 @@ local function drawFinishPanel()
       items[#items + 1] = {
         row = true, i = i,
         ini = (r and r.initials ~= "") and r.initials or "---",
-        time = r and fmtTime(r.time) or "--",
+        time = r and fmtRecord(stage, r.time) or "--",
         col = r and r.color ~= "" and r.color or nil,
         hl = finishInfo ~= nil and finishInfo.rank == i,        -- 今回の記録を目立たせる
       }
@@ -1201,7 +1357,8 @@ local function drawEntryPanel()
   love.graphics.setFont(msgFont)
   love.graphics.setColor(0.2, 0.3, 0.4)
   love.graphics.printf("NEW RANK #" .. tostring(entryRank) .. "!", L.px, L.py + 16, L.bw, "center")
-  love.graphics.printf(fmtTime(elapsed), L.px, L.py + 16 + L.lh, L.bw, "center")
+  local v = recordValue()
+  love.graphics.printf(isScoreStage(stage) and (v .. " pops") or fmtTime(v), L.px, L.py + 16 + L.lh, L.bw, "center")
 
   love.graphics.setFont(hudFont)
   for i, s in ipairs(L.slots) do                                  -- 桁ごとの上下ボタンと文字
@@ -1289,8 +1446,8 @@ local function drawRoller(cy, r, phase, fresh)
   love.graphics.rectangle("fill", x0 + 4, cy - r * 0.62, w - 8, math.max(2, r * 0.18), 2, 2)
 end
 
--- 全部潰したときのお祝い: 紙吹雪と「PERFECT!」の文字
-local function drawCelebration()
+-- 紙吹雪
+local function drawConfetti()
   for _, c in ipairs(roll.confetti) do
     if c.y < view.h + 20 then
       love.graphics.push()
@@ -1301,10 +1458,15 @@ local function drawCelebration()
       love.graphics.pop()
     end
   end
+end
+
+-- 全部潰したときのお祝い: 紙吹雪と「PERFECT!」の文字
+local function drawCelebration()
+  drawConfetti()
   local t = love.timer.getTime() - roll.clearAt
   local k = 1 + 0.08 * math.sin(t * 6) + 0.6 * math.max(0, 1 - t / 0.35)   -- 最初にポンと大きく出て、あとは脈打つ
   love.graphics.setFont(titleFont)
-  local text = "PERFECT!"
+  local text = roll.celebrate.title
   local tw, th = titleFont:getWidth(text), titleFont:getHeight()
   love.graphics.push()
   love.graphics.translate(view.w / 2, HUD_H + 70)
@@ -1317,7 +1479,61 @@ local function drawCelebration()
   love.graphics.pop()
   love.graphics.setFont(msgFont)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.printf("Congratulations!", 0, HUD_H + 70 + th * 0.6, view.w, "center")
+  love.graphics.printf(roll.celebrate.sub, 0, HUD_H + 70 + th * 0.6, view.w, "center")
+end
+
+-- エンドレスロール: 「50 POPS!」の達成表示。ポンと大きく出て、少し上へ動きながら消える
+local function drawMilestone()
+  local m = roll.milestone
+  if not m then return end
+  local t = love.timer.getTime() - m.t
+  if t > MILESTONE_SHOW then return end
+  local fade = math.min(1, (MILESTONE_SHOW - t) / 0.4)
+  local k = (m.big and 1.25 or 1.0) * (1 + 0.7 * math.max(0, 1 - t / 0.2)) * (1 + 0.04 * math.sin(t * 10))
+  local text = m.n .. " POPS!"
+  love.graphics.setFont(titleFont)
+  local tw, th = titleFont:getWidth(text), titleFont:getHeight()
+  love.graphics.push()
+  love.graphics.translate(view.w / 2, 330 - 30 * (t / MILESTONE_SHOW))
+  love.graphics.scale(math.min(k, (view.w - 24) / tw))
+  love.graphics.setColor(0.2, 0.3, 0.45, 0.4 * fade)
+  love.graphics.print(text, -tw / 2 + 3, -th / 2 + 3)
+  if m.big then
+    love.graphics.setColor(1, 0.72 + 0.15 * math.sin(t * 8), 0.15, fade)              -- 100個ごとは金色
+  else
+    love.graphics.setColor(0.95, 0.45, 0.65, fade)
+  end
+  love.graphics.print(text, -tw / 2, -th / 2)
+  love.graphics.pop()
+  if m.big then
+    love.graphics.setFont(msgFont)
+    love.graphics.setColor(0.2, 0.3, 0.4, fade)
+    love.graphics.printf("Great!", 0, 330 + th * 0.55, view.w, "center")
+  end
+end
+
+-- エンドレスロール: 潰した粒の上に「5 COMBO」の文字が浮かんで消える
+local function drawComboFx()
+  local fx = roll.comboFx
+  if not fx then return end
+  local t = love.timer.getTime() - fx.t
+  if t > COMBO_SHOW then return end
+  local q = t / COMBO_SHOW
+  local y = clamp(fx.y - scrollY - 30 - 40 * q, ROLL_TOUCH_TOP, ROLL_TOUCH_BOT)
+  local k = 1 + 0.4 * math.max(0, 1 - t / 0.12)                  -- 出た瞬間だけ少し大きい
+  love.graphics.setFont(msgFont)
+  local text = fx.n .. " COMBO"
+  local tw = msgFont:getWidth(text)
+  local x = clamp(fx.x, tw / 2 + 8, view.w - tw / 2 - 8)
+  love.graphics.push()
+  love.graphics.translate(x, y)
+  love.graphics.scale(k)
+  love.graphics.setColor(0.2, 0.3, 0.45, 0.5 * (1 - q))
+  love.graphics.print(text, -tw / 2 + 2, -msgFont:getHeight() / 2 + 2)
+  local hot = math.min(1, fx.n / 12)                              -- コンボが続くほど赤っぽく
+  love.graphics.setColor(0.95, 0.75 - 0.4 * hot, 0.25, 1 - q)
+  love.graphics.print(text, -tw / 2, -msgFont:getHeight() / 2)
+  love.graphics.pop()
 end
 
 local function drawRollers()
@@ -1364,12 +1580,16 @@ local function drawPlay()
   love.graphics.setColor(crgb[1], crgb[2], crgb[3], 1)
   love.graphics.circle("fill", 22, 27, 6)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  love.graphics.print(string.format("%d / %d", popped, total), 36, 18)
+  if isEndless() then                                              -- エンドレスロールは潰した個数だけ
+    love.graphics.print(popped .. " pops", 36, 18)
+  else
+    love.graphics.print(string.format("%d / %d", popped, total), 36, 18)
+  end
   local shown = isRoller() and math.max(0, roll.limit - elapsed) or elapsed   -- ローラー送りは残り時間
   love.graphics.printf(fmtTime(shown), 0, 18, view.w, "center")
   if stage.record then
     local best = Records.best(recId())
-    love.graphics.printf("BEST " .. (best and fmtTime(best) or "--"), 0, 18, view.w - 16, "right")
+    love.graphics.printf("BEST " .. fmtRecord(stage, best), 0, 18, view.w - 16, "right")
   else
     love.graphics.printf("[R] reset", 0, 18, view.w - 16, "right")
   end
@@ -1387,7 +1607,8 @@ local function drawPlay()
     love.graphics.printf(START_LABEL, r.x, r.y + (r.h - msgFont:getHeight()) / 2, r.w, "center")
   end
   if not entering then drawBar() end                              -- 入力中はうっかり押さないよう隠す
-  if isRoller() and roll.result == "clear" then drawCelebration() end
+  if isEndless() then drawComboFx() drawMilestone() end
+  if isRoller() and roll.celebrate then drawCelebration() elseif isEndless() then drawConfetti() end
   if entering then drawEntryPanel() elseif finished then drawFinishPanel() end
 
   if useFinger() then                                            -- 指のカーソル(いちばん手前)
@@ -1456,7 +1677,7 @@ local function drawMenu()
       love.graphics.setColor(rgb[1], rgb[2], rgb[3], 1)
       love.graphics.circle("fill", x + 18, y + 82, 4)
       love.graphics.setColor(0.30, 0.55, 0.80)
-      love.graphics.print("BEST " .. (best and fmtTime(best) or "--"), x + 30, y + 70)
+      love.graphics.print("BEST " .. fmtRecord(s, best), x + 30, y + 70)
     end
   end
 
@@ -1524,7 +1745,7 @@ local function drawRecords()
           if s.record.initials then
             line = line .. ((r and r.initials ~= "") and r.initials or "---") .. "  "
           end
-          line = line .. (r and fmtTime(r.time) or "--")
+          line = line .. (r and fmtRecord(s, r.time) or "--")
           love.graphics.setColor(0.35, 0.45, 0.55)
           love.graphics.print(line, cx, y)
         end
@@ -1540,6 +1761,7 @@ local function drawRecords()
 end
 
 function love.draw()
+  if scene == "play" and stage and stage.bg then love.graphics.clear(stage.bg) end   -- ステージごとの背景色
   love.graphics.push()
   love.graphics.translate(view.ox, view.oy)
   love.graphics.scale(view.scale)

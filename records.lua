@@ -49,25 +49,27 @@ function Records.top(id)
   return data[id] or {}
 end
 
--- 最高記録(秒)。なければ nil
+-- 最高記録(タイムなら最短、個数なら最多。並べ替え済みなので先頭)。なければ nil
 function Records.best(id)
   local list = data[id]
   return list and list[1] and list[1].time or nil
 end
 
 -- 上位n位以内に入る記録なら順位(1〜n)を返す。圏外なら nil(保存はしない)
-function Records.qualifies(id, time, n)
+-- desc = true: 値が大きいほど上(エンドレスロールの潰した個数)。省略時は小さいほど上(タイム)
+function Records.qualifies(id, time, n, desc)
   time = round2(time)
   local rank = 1
   for _, r in ipairs(data[id] or {}) do
-    if r.time <= time then rank = rank + 1 end   -- 同タイムは先に出した人が上
+    if (desc and r.time >= time) or (not desc and r.time <= time) then rank = rank + 1 end   -- 同じ値は先に出した人が上
   end
   if rank <= n then return rank end
   return nil
 end
 
 -- 記録を追加して保存する。上位n位以内なら順位を返す。圏外なら nil
-function Records.add(id, time, n, initials, color)
+-- desc = true: 値が大きいほど上(エンドレスロールの潰した個数)。time の欄にその値を入れる
+function Records.add(id, time, n, initials, color, desc)
   time = round2(time)
   local list = data[id] or {}
   for i, r in ipairs(list) do r.seq = i end
@@ -75,7 +77,10 @@ function Records.add(id, time, n, initials, color)
                 color = color or "", seq = #list + 1 }
   list[#list + 1] = rec
   table.sort(list, function(a, b)
-    if a.time ~= b.time then return a.time < b.time end
+    if a.time ~= b.time then
+      if desc then return a.time > b.time end
+      return a.time < b.time
+    end
     return a.seq < b.seq                          -- 同タイムは先に出した記録が上
   end)
   local rank

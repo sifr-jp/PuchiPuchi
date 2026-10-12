@@ -296,12 +296,17 @@ function Sound.playBoyoon(amount)
 end
 
 -- idx: 粒に割り当てた破裂音の番号(1〜NUM_VARIANTS)。振動も一緒に鳴らす
-function Sound.playPop(idx)
+-- pitch: 省略可。指定すると音の高さをこの倍率にそろえる(エンドレスロールのコンボで音程を上げる)
+function Sound.playPop(idx, pitch)
   if idx == lastPopIdx then idx = idx % NUM_VARIANTS + 1 end   -- 同じ音が続けて鳴らないように
   lastPopIdx = idx
   local v = variants[idx]
   local src = v.src:clone()          -- 重ねて鳴らせるようにクローン
-  src:setPitch(rand(0.82, 1.10) * pitchScale)
+  if pitch then
+    src:setPitch(pitch * rand(0.98, 1.02) * pitchScale)          -- ばらつきを小さくして音程の上がり方を聞かせる
+  else
+    src:setPitch(rand(0.82, 1.10) * pitchScale)
+  end
   src:setVolume(rand(0.7, 1.0))
   src:play()
   if love.system.vibrate then        -- 非対応環境では何もしない
@@ -402,12 +407,76 @@ local function makeFanfare()
   return toSource(buf, n, 0.85)
 end
 
-local buzzerSrc, fanfareSrc = nil, nil
+---------------------------------------------------------------
+-- 「キラッ」(Lv2-2 で星の潰れ方のとき)。ガラスのような倍音がすっと消える
+---------------------------------------------------------------
+local function makeChime(f)
+  local dur = 0.35
+  local n = math.floor(SAMPLE_RATE * dur)
+  local parts = { { 1, 1.0, 0.16 }, { 2.76, 0.5, 0.08 }, { 5.40, 0.25, 0.04 } }   -- 倍率・音量・減衰(秒)
+  local buf = {}
+  for i = 0, n - 1 do
+    local t = i / SAMPLE_RATE
+    local v = 0
+    for _, pt in ipairs(parts) do v = v + math.sin(2 * pi * f * pt[1] * t) * pt[2] * math.exp(-t / pt[3]) end
+    buf[i] = v * math.min(1, t / 0.002) * math.min(1, (n - 1 - i) / 200)
+  end
+  return toSource(buf, n, 0.5)
+end
 
--- ブザーとファンファーレを前もって作っておく(鳴らす瞬間に止まらないように、ステージに入るときに呼ぶ)
+---------------------------------------------------------------
+-- 達成のジングル(Lv2-2 で 50個ごと)。big = true(100個ごと)は1音多く、最後を和音で伸ばす
+---------------------------------------------------------------
+local function makeMilestone(big)
+  local notes = big
+    and { { 784, 0.00, 0.09 }, { 988, 0.09, 0.09 }, { 1175, 0.18, 0.09 }, { 1568, 0.27, 0.55 }, { 1175, 0.27, 0.55 } }
+    or  { { 1047, 0.00, 0.08 }, { 1319, 0.08, 0.08 }, { 1568, 0.16, 0.30 } }
+  local dur = big and 1.0 or 0.6
+  local n = math.floor(SAMPLE_RATE * dur)
+  local buf = {}
+  for i = 0, n - 1 do buf[i] = 0 end
+  for _, nt in ipairs(notes) do
+    local f, t0, len = nt[1], nt[2], nt[3]
+    local i0 = math.floor(t0 * SAMPLE_RATE)
+    local m = math.floor((len + 0.15) * SAMPLE_RATE)
+    for j = 0, m - 1 do
+      local i = i0 + j
+      if i >= n then break end
+      local t = j / SAMPLE_RATE
+      local env = math.min(1, t / 0.004) * math.exp(-t / (len * 0.9 + 0.05))      -- 鉄琴のように叩いて消える
+      buf[i] = buf[i] + (math.sin(2 * pi * f * t) + 0.35 * math.sin(2 * pi * f * 2 * t)
+                         + 0.15 * math.sin(2 * pi * f * 3.01 * t)) * env
+    end
+  end
+  for i = 0, n - 1 do local d = buf[i] * 0.5 buf[i] = d / (1 + math.abs(d)) end
+  return toSource(buf, n, 0.8)
+end
+
+local buzzerSrc, fanfareSrc = nil, nil
+local chimeSrc, milestoneSmall, milestoneBig = nil, nil, nil
+
+-- ブザー・ファンファーレ・キラッ・達成のジングルを前もって作っておく(鳴らす瞬間に止まらないように、ステージに入るときに呼ぶ)
 function Sound.prepareJingles()
   if not buzzerSrc then buzzerSrc = makeBuzzer() end
   if not fanfareSrc then fanfareSrc = makeFanfare() end
+  if not chimeSrc then chimeSrc = { makeChime(1760), makeChime(2093), makeChime(2349) } end
+  if not milestoneSmall then milestoneSmall, milestoneBig = makeMilestone(false), makeMilestone(true) end
+end
+
+-- pitch: 省略可。コンボで上がった音程に合わせる
+function Sound.playChime(pitch)
+  Sound.prepareJingles()
+  local s = chimeSrc[love.math.random(#chimeSrc)]:clone()
+  s:setPitch((pitch or 1) * rand(0.97, 1.03))
+  s:setVolume(0.35)
+  s:play()
+end
+
+function Sound.playMilestone(big)
+  Sound.prepareJingles()
+  local s = (big and milestoneBig or milestoneSmall):clone()
+  s:setVolume(big and 1.0 or 0.85)
+  s:play()
 end
 
 function Sound.playBuzzer()

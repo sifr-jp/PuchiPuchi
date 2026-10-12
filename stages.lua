@@ -21,6 +21,15 @@
 --   time        mode = "roller" のときの制限時間(秒)。色ごとに { blue =, yellow =, pink = }
 --               シートは一定の速さで送られ、最後の段がちょうど制限時間で下端に着く
 --               Lv2 では色は制限時間などを決め、命中判定はいつも Blue と同じ広さ
+--               "endless": エンドレスロール(Lv2-2)。制限時間のあいだ、だんだん速くなるシートを潰す
+--   speedFrom   mode = "endless" の送り始めの速さ(px/秒)。色ごと
+--   speedTo     mode = "endless" の制限時間ちょうどの速さ(px/秒)。色ごと。シートの長さは自動で決まる
+--   record.score  true: タイムではなく潰した個数を記録する(多いほど上)
+--   softPop     true: 粒が軽く触れるだけで潰れる
+--   popFx       true: 潰れ方を4種類(輪・火花・もや・星)からばらばらにする
+--   rainbow     true: シートを虹色にする
+--   bg          背景色 { r, g, b }。省略時はいつもの水色
+--   milestone   この個数ごとに達成表示とジングル(その2倍ごとは大きく)
 
 -- 潰せる粒の数: 奇数行は cols 個、偶数行は両端が半割なので (cols - 1) 個
 local function count(cols, rows)
@@ -68,5 +77,16 @@ return {
     time = { blue = 60, yellow = 45, pink = 30 },
     finger = true, scroll = false,
     record = { n = 3, initials = true },
+  },
+  {
+    id = "2-2", title = "Lv2-2  Endless", level = 2, mode = "endless",
+    sub = "Easy pop  /  combo  /  50, 100...",
+    free = false, cols = 8, hardRatio = 0, pressTime = 0.10,
+    softPop = true, popFx = true, rainbow = true, bg = { 0.99, 0.93, 0.86 }, milestone = 50,
+    time = { blue = 60, yellow = 90, pink = 120 },
+    speedFrom = { blue = 22, yellow = 22, pink = 22 },
+    speedTo = { blue = 45, yellow = 60, pink = 75 },
+    finger = true, scroll = false,
+    record = { n = 3, initials = true, score = true },
   },
 }
