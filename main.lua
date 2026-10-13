@@ -32,6 +32,16 @@
 --   v2.4: Lv2-2 を Lv2-1 とはっきり違う手触りに。粒は軽く触れるだけで潰れ、虹色のシートと暖かい背景。
 --         潰れ方は4種類(輪・火花・もや・星)で、星は「キラッ」も鳴る。50個ごとに「50 POPS!」と
 --         ジングルと紙吹雪(100個ごとは金色で大きく)
+--   v2.5: Lv2-3 積もるシート。小さなシート片が上から落ちて積もる。片の粒を全部潰すと片が消える。
+--         着地する前に消すと AIR ボーナス(+2)。上まで積もったら下の段から自動で巻き取る(ゲームオーバーなし)。
+--         90秒の点数(消した片 + AIR ボーナス)を記録。粒の大きさは Blue 大粒 / Yellow 中粒 / Pink 小粒
+--   v2.6: Lv2-3 を作り直し。箱は角丸で立体的に。片の粒を全部潰すと箱が銀色になり、最下列が銀色の箱で
+--         すき間なく埋まるとその列が消える(LINE! +10)。箱が最上段に届いたらゲームオーバー。
+--         粒は軽く触れるだけで潰れ、潰れ方4種とコンボで上がる音。1粒1点、着地前に潰し切ると AIR! +5。
+--         50点ごとに達成表示(100点ごとは大きく)。Blue / Yellow は90秒、Pink は時間制限なし
+--   v2.7: Lv2-3 Yellow だけ消え方をテトリス式に(どの段でも横一列が箱で埋まれば消える。潰したかは問わない)
+--   v2.8: Lv2-3 Pink だけ、潰し切った(銀色の)箱を1タッチで時計回りに90度回せる
+--   v2.9: 回した箱は、近くでいちばんぴったり入るすき間を探して、そこへ落ちてはまる
 
 local Sound = require("sound")
 local Records = require("records")
@@ -71,6 +81,11 @@ local CONFETTI_N = 140          -- 全部潰したときの紙吹雪の数
 local COMBO_GAP = 0.9           -- エンドレスロール: この時間(秒)以内に次を潰すとコンボが続く
 local COMBO_SHOW = 0.8          -- コンボの文字が浮かんで消えるまでの時間(秒)
 local MILESTONE_SHOW = 1.6      -- 「50 POPS!」などの達成表示が出ている時間(秒)
+
+-- 積もるシート(Lv2-3)
+local STACK_BOTTOM_GAP = 14     -- 片が積もる枠の下端と、MENU/RESET帯とのすき間
+local STACK_FX_SHOW = 0.9       -- 「AIR! +5」「LINE! +10」の文字が浮かんで消えるまでの時間(秒)
+local STACK_FLASH = 0.35        -- 最下列が消えたときに光る時間(秒)
 
 ---------------------------------------------------------------
 -- 状態
@@ -124,6 +139,21 @@ local roll = { start = 0, speed = 30, limit = 60, missed = 0, rowLeft = {}, phTo
                result = nil, confetti = {}, clearAt = 0, celebrate = nil,
                v0 = 20, v1 = 40, combo = 0, maxCombo = 0, comboAt = -10, comboFx = nil, milestone = nil }
 
+-- 積もるシートの状態
+--   board: 片が積もる枠 { x, y, w, h, cols, rows }(cols, rows は粒の数)
+--   pieces: 落ちている片と積もった片。片は { cells, bubbles, gx, fy, w, h, landed, everLanded, left, col, crushed }
+--     cells[i] = { 列, 段 }(片の中の位置) / gx: 片の左端の列 / fy: 片の上端の段(落ちている間は小数)
+--     landed: いま着地している / everLanded: 一度でも着地した(AIR ボーナスの判定) / left: 潰していない粒の数
+--     crushed: 粒を全部潰した(箱が銀色になる)
+--   lines: 消した列の数 / air: 着地前に潰し切った片の数 / score: 点数(1粒1点、AIR +5、列 +10)
+--   nextAt: 次の片を出す時刻(経過時間) / nextMs: 次の達成表示の点数 / over: ゲームオーバー
+--   flash: 最下列が消えた光 { t, y } / fx: 浮かぶ文字 { x, y, t, text, air }
+local stk = { board = { x = 0, y = 0, w = 0, h = 0, cols = 5, rows = 7 }, pieces = {},
+              lines = 0, air = 0, score = 0, nextAt = 0, nextMs = 50, over = false, flash = nil, fx = {} }
+
+-- 紙吹雪(spawnConfetti)は下で定義する。達成表示からも使うので先に名前だけ用意する
+local spawnConfetti
+
 -- ローラーのあるステージ(Lv2-1 ローラー送り / Lv2-2 エンドレスロール)
 local function isRoller()
   return stage ~= nil and (stage.mode == "roller" or stage.mode == "endless")
@@ -131,6 +161,22 @@ end
 
 local function isEndless()
   return stage ~= nil and stage.mode == "endless"
+end
+
+-- 積もるシート(Lv2-3)
+local function isStack()
+  return stage ~= nil and stage.mode == "stack"
+end
+
+-- 開始ボタン(TAP TO START)を押すまで待つステージ
+local function needsStart()
+  return isRoller() or isStack()
+end
+
+-- stages.lua の値が色ごとの表 { blue =, yellow =, pink = } ならいまの色の値、そうでなければそのまま
+local function perColor(v)
+  if type(v) == "table" then return v[colorMode] end
+  return v
 end
 
 -- 送り始めてから t 秒で送った量(px)。エンドレスロールは速さが v0 から v1 へ一定の割合で上がる
@@ -141,12 +187,13 @@ local function rollDistance(t)
   return roll.speed * t
 end
 
--- 記録する値: エンドレスロールは潰した個数(多いほど上)、それ以外はタイム(短いほど上)
+-- 記録する値: エンドレスロールは潰した個数、積もるシートは点数(どちらも多いほど上)、それ以外はタイム(短いほど上)
 local function isScoreStage(s)
   return s and s.record and s.record.score
 end
 
 local function recordValue()
+  if isStack() then return stk.score end
   if isScoreStage(stage) then return popped end
   return elapsed
 end
@@ -236,12 +283,18 @@ local function playBottom()
   return view.h - BAR_H
 end
 
--- シートが見える範囲(上端・下端)。ローラー送りでは上下のローラーの中心で切る
+-- シートが見える範囲(上端・下端)。ローラー送りでは上下のローラーの中心で切る。積もるシートは枠の下端まで
 local function clipTop() return isRoller() and ROLL_TOP_CY or HUD_H end
-local function clipBottom() return isRoller() and ROLL_BOT_CY or playBottom() end
+local function clipBottom()
+  if isStack() then return stk.board.y + stk.board.h end
+  return isRoller() and ROLL_BOT_CY or playBottom()
+end
 -- 粒に触れられる範囲(上端・下端)
 local function touchTop() return isRoller() and ROLL_TOUCH_TOP or HUD_H end
-local function touchBottom() return isRoller() and ROLL_TOUCH_BOT or playBottom() end
+local function touchBottom()
+  if isStack() then return stk.board.y + stk.board.h end
+  return isRoller() and ROLL_TOUCH_BOT or playBottom()
+end
 
 ---------------------------------------------------------------
 -- シートの生成とレイアウト
@@ -306,42 +359,479 @@ local function layout()
                 left = makeWob(sheet.h), right = makeWob(sheet.h) }
 end
 
+-- 粒を1つ作る。c, r: シートの列と行 / col: 粒の色(省略時は虹色のシートなら行ごとの色)
+local function makeBubble(c, r, col)
+  local hard = love.math.random() < stage.hardRatio
+  local b = {
+    c = c, r = r,
+    press = 0,
+    -- 粒ごとの「潰れにくさ」。伸びる粒は素早いなぞりでは潰れない。softPop のステージは軽く触れるだけで潰れる
+    thresh = hard and rand(1.2, 1.8) or (stage.softPop and rand(0.30, 0.50) or rand(0.6, 1.1)),
+    hard = hard,
+    speed = rand(0.7, 1.3),                    -- 粒ごとの押し込み速度の個体差
+    seed = rand(0, 100),                       -- 押し込み速度の時間変化用
+    held = false, stretched = false,
+    dwell = 0,                                 -- 今回の接触で押し続けた時間
+    wobA = 0, wobT = 10,                       -- 離したときの揺れ
+    popped = false, t = 0,
+    snd = love.math.random(Sound.NUM_VARIANTS),
+    sz = rand(0.97, 1.03),                     -- 大きさの個体差
+    tint = rand(-0.03, 0.03),                  -- 色味の個体差
+    hx = rand(-0.35, 0.35), hy = rand(-0.35, 0.35),  -- 破裂後の穴の位置
+    wr = {},                                   -- 破裂後のしわ(少なめ・太め・柔らかく)
+    -- 潰れ方の種類(popFx のステージだけ): 1=輪 2=火花 3=空気のもや 4=星
+    fx = stage.popFx and love.math.random(4) or 1,
+    -- 虹色のシート(rainbow のステージだけ): 行ごとに色相を少しずつずらす
+    col = col or (stage.rainbow and hsv((r * 0.045 + c * 0.012) % 1, 0.42, 1) or nil),
+  }
+  for i = 1, 5 do
+    local a, d = rand(0, 2 * pi), rand(0.1, 0.7)
+    local x1, y1 = math.cos(a) * d, math.sin(a) * d
+    b.wr[i] = { x1, y1, x1 + rand(-0.4, 0.4), y1 + rand(-0.4, 0.4) }
+  end
+  return b
+end
+
+---------------------------------------------------------------
+-- 積もるシート(Lv2-3): 粒の入った箱(片)が上から落ちてきて、枠の下に積もる
+---------------------------------------------------------------
+-- 片の形(片の中の { 列, 段 })。2×2 と 1×4 は2回入れて出やすくする
+local SHAPES = {
+  { { 0, 0 }, { 1, 0 } },                                  -- 2粒
+  { { 0, 0 }, { 1, 0 }, { 2, 0 } },                        -- 3粒の棒
+  { { 0, 0 }, { 1, 0 }, { 0, 1 } },                        -- 3粒のかぎ
+  { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } },              -- 2×2
+  { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } },
+  { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 } },              -- 1×4
+  { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 3, 0 } },
+  { { 0, 0 }, { 1, 0 }, { 2, 0 }, { 1, 1 } },              -- T
+  { { 0, 0 }, { 0, 1 }, { 0, 2 }, { 1, 2 } },              -- L
+  { { 1, 0 }, { 1, 1 }, { 1, 2 }, { 0, 2 } },              -- J
+  { { 1, 0 }, { 2, 0 }, { 0, 1 }, { 1, 1 } },              -- S
+  { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 2, 1 } },              -- Z
+}
+-- 箱の色。消え方(clearRule)が "color" のときはこの3色から選ぶ。それ以外は淡い色をランダムに
+local BOX_COLORS = { { 0.55, 0.75, 1.0 }, { 1.0, 0.85, 0.40 }, { 1.0, 0.62, 0.78 } }
+local CRUSHED_COL = { 0.80, 0.84, 0.90 }                    -- 粒を全部潰した箱の色(銀色)
+
+-- 枠の大きさ。横の粒の数は色ごと(stages.lua の cols)、段の数は画面の高さに入るだけ
+-- 片は上部の表示エリアのすぐ下から見えて触れられる(枠の上端より上でも潰せる)
+local function stackLayout()
+  local B = stk.board
+  B.cols = perColor(stage.cols)
+  cell = math.min((view.w - 2 * MARGIN) / B.cols, stage.maxCell or 96)
+  local bottom = playBottom() - STACK_BOTTOM_GAP
+  B.rows = math.floor((bottom - HUD_H - 8) / cell)
+  B.w, B.h = B.cols * cell, B.rows * cell
+  B.x = (view.w - B.w) / 2
+  B.y = bottom - B.h
+  sheet.x, sheet.y, sheet.w, sheet.h = B.x, HUD_H, B.w, bottom - HUD_H   -- 命中判定(hit)はこの範囲だけ
+  scrollY, maxScroll = 0, 0
+end
+
+local function stackInit()
+  stackLayout()
+  stk.pieces, stk.fx, stk.flash = {}, {}, nil
+  stk.lines, stk.air, stk.score, stk.nextAt, stk.nextMs, stk.over = 0, 0, 0, 0, stage.milestone or 50, false
+  roll.limit = perColor(stage.time) or math.huge            -- 時間制限の無い色は、ゲームオーバーまで続く
+  roll.result, roll.confetti, roll.celebrate = nil, {}, nil
+  roll.combo, roll.maxCombo, roll.comboAt, roll.comboFx, roll.milestone = 0, 0, -10, nil, nil
+end
+
+-- 点数を足す。50点ごとに達成表示とジングルと紙吹雪(100点ごとは大きく)
+local function stackAddPoints(n)
+  stk.score = stk.score + n
+  local every = stage.milestone or 50
+  while stk.score >= stk.nextMs do
+    local big = stk.nextMs % (every * 2) == 0
+    roll.milestone = { n = stk.nextMs, t = love.timer.getTime(), big = big, unit = " POINTS!" }
+    spawnConfetti(big and 90 or 45)
+    if Sound.playMilestone then Sound.playMilestone(big) end
+    stk.nextMs = stk.nextMs + every
+  end
+end
+
+-- 浮かぶ文字(「AIR! +5」「LINE! +10」)
+local function stackFx(x, y, text, gold)
+  stk.fx[#stk.fx + 1] = { x = x, y = y, t = love.timer.getTime(), text = text, air = gold }
+end
+
+-- 片 p を段 row に置けるか(grid: 積もった片の粒の位置。枠の上にはみ出した段も含む。p 自身の粒は数えない)
+local function stackFits(p, row, grid)
+  local B = stk.board
+  for _, c in ipairs(p.cells) do
+    local r = row + c[2]
+    if r >= B.rows then return false end
+    local q = grid[r * B.cols + p.gx + c[1]]
+    if q and q ~= p then return false end
+  end
+  return true
+end
+
+-- 片 p が段 row から真下に落ちたときに止まる段
+local function stackDrop(p, row, grid)
+  if not stackFits(p, row, grid) then return row end
+  while stackFits(p, row + 1, grid) do row = row + 1 end
+  return row
+end
+
+-- 片の幅・高さを数え直し、片の中の位置を左上にそろえる
+local function stackNormalize(p)
+  local minX, minY = math.huge, math.huge
+  for _, c in ipairs(p.cells) do minX, minY = math.min(minX, c[1]), math.min(minY, c[2]) end
+  p.w, p.h = 0, 0
+  for _, c in ipairs(p.cells) do
+    c[1], c[2] = c[1] - minX, c[2] - minY
+    p.w, p.h = math.max(p.w, c[1] + 1), math.max(p.h, c[2] + 1)
+  end
+  p.gx, p.fy = p.gx + minX, p.fy + minY
+end
+
+-- 形 base を n 回 90度回した片を作る(枠より広ければ縦にする)
+local function stackShape(base, n)
+  local p = { cells = {}, gx = 0, fy = 0 }
+  for i, c in ipairs(base) do p.cells[i] = { c[1], c[2] } end
+  for _ = 1, n do
+    for _, c in ipairs(p.cells) do c[1], c[2] = -c[2], c[1] end
+  end
+  stackNormalize(p)
+  if p.w > stk.board.cols then
+    for _, c in ipairs(p.cells) do c[1], c[2] = c[2], c[1] end
+    p.gx, p.fy = 0, 0
+    stackNormalize(p)
+  end
+  return p
+end
+
+-- 片を段 row に置いたときの盤面の悪さ(小さいほどよい置き場所)
+-- すき間(上を箱でふさがれた空きマス)を強く嫌い、次に高さと凸凹を嫌う
+local function stackBadness(p, row, grid)
+  local B = stk.board
+  local own = {}
+  for _, c in ipairs(p.cells) do own[(row + c[2]) * B.cols + p.gx + c[1]] = true end
+  local holes, bump, maxH, prevH = 0, 0, 0, nil
+  for x = 0, B.cols - 1 do
+    local h, covered = 0, false
+    for r = math.min(row, 0), B.rows - 1 do
+      local k = r * B.cols + x
+      if grid[k] or own[k] then
+        if not covered then covered, h = true, B.rows - r end
+      elseif covered then
+        holes = holes + 1
+      end
+    end
+    maxH = math.max(maxH, h)
+    if prevH then bump = bump + math.abs(h - prevH) end
+    prevH = h
+  end
+  return holes * 6 + bump + maxH * 1.5
+end
+
+-- 新しい片を枠の上から出す。出せる場所が無ければ false(grid: 積もった片の粒の位置)
+-- 置き場所はプレイヤーが選べないので、形・向き・列をいくつか試し、すき間ができず低く着地する所に出す
+-- (最下列がすき間なく埋まりやすくなる)
+local function stackSpawn(grid)
+  local B = stk.board
+  local top0 = -(B.y - HUD_H) / cell                         -- 上部の表示エリアの下端(段)
+  -- いま落ちている片が着地する所も埋まっているものとして考える(stk.pieces は下にある順に並んでいる)
+  local future = {}
+  for k, q in pairs(grid) do future[k] = q end
+  for _, q in ipairs(stk.pieces) do
+    if not q.landed then
+      local r = stackDrop(q, math.ceil(q.fy), future)
+      for _, c in ipairs(q.cells) do future[(r + c[2]) * B.cols + q.gx + c[1]] = q end
+    end
+  end
+  grid = future
+  local best, bestScore
+  for _ = 1, (stage.spawnTries or 3) do
+    local base = SHAPES[love.math.random(#SHAPES)]
+    for n = 0, 3 do
+      local p = stackShape(base, n)
+      local row0 = math.floor(top0 - p.h)
+      for x = 0, B.cols - p.w do
+        p.gx = x
+        -- まだ出かかっている片とも、上まで積もった片とも重ならない所
+        local ok = stackFits(p, row0, grid) and stackFits(p, row0 + 2, grid)
+        for _, q in ipairs(stk.pieces) do
+          if not q.landed and q.fy < top0 + 0.3 and x < q.gx + q.w and q.gx < x + p.w then ok = false break end
+        end
+        if ok then
+          local row = stackDrop(p, row0, grid)
+          local score = stackBadness(p, row, grid) + rand(0, 0.8)
+          if not bestScore or score < bestScore then
+            bestScore = score
+            best = { base = base, n = n, gx = x }
+          end
+        end
+      end
+    end
+  end
+  if not best then return false end
+  local p = stackShape(best.base, best.n)
+  p.gx = best.gx
+  p.fy = top0 - p.h                                          -- 上部の表示エリアのすぐ上から落ち始める
+  p.bubbles, p.landed, p.everLanded = {}, false, false
+  local rule = perColor(stage.clearRule) or "crushed"
+  if rule == "color" then p.col = BOX_COLORS[love.math.random(#BOX_COLORS)]
+  elseif rule == "any" then p.col = BOX_COLORS[1]
+  else p.col = hsv(love.math.random(), 0.45, 1) end          -- 片ごとに淡い色
+  p.left = #p.cells
+  for i, c in ipairs(p.cells) do
+    local b = makeBubble(c[1], c[2], p.col)
+    b.piece = p
+    p.bubbles[i] = b
+    bubbles[#bubbles + 1] = b
+  end
+  stk.pieces[#stk.pieces + 1] = p
+  return true
+end
+
+-- 片の粒を全部潰した: 箱が銀色になる。着地する前なら AIR ボーナス
+local function stackCrush(p)
+  if p.crushed then return end
+  p.crushed = true
+  for _, b in ipairs(p.bubbles) do b.col = CRUSHED_COL end
+  if (perColor(stage.clearRule) or "crushed") == "crushed" then p.col = CRUSHED_COL end
+  if not p.everLanded then
+    stk.air = stk.air + 1
+    local x, y = 0, 0
+    for _, b in ipairs(p.bubbles) do x, y = x + b.x, y + b.y end
+    local n = math.max(1, #p.bubbles)
+    stackFx(x / n, y / n, "AIR! +5", true)
+    stackAddPoints(5)
+  end
+end
+
+-- 粒を潰したとき(pop から呼ぶ)。1粒 1点。星の潰れ方は「キラッ」も鳴る
+local function stackPop(b, pitch)
+  if b.fx == 4 and Sound.playChime then Sound.playChime(pitch) end
+  stackAddPoints(1)
+  local p = b.piece
+  if not p then return end
+  p.left = p.left - 1
+  if p.left <= 0 then stackCrush(p) end
+end
+
+-- 列のマスにある箱が、消える条件に合うか
+local function rowOk(p, first, rule)
+  if rule == "crushed" then return p.crushed end            -- 潰し切った(銀色の)箱だけ
+  if rule == "color" then return p.col == first.col end     -- 同じ色の箱だけ
+  return true                                               -- どの箱でも("any" / "tetris")
+end
+
+-- 段 r が条件に合う箱ですき間なく埋まっているか
+local function rowFull(r, grid, rule)
+  local B = stk.board
+  local first = grid[r * B.cols]
+  if not first then return false end
+  for i = 0, B.cols - 1 do
+    local p = grid[r * B.cols + i]
+    if not p or not p.landed or not rowOk(p, first, rule) then return false end
+  end
+  return true
+end
+
+-- 横一列が埋まったら、その列の箱が消える(上の箱は落ちる)
+-- "tetris" はどの段でも、それ以外は最下列だけを調べる。1コマに消すのは1列(続きは次のコマで)
+local function stackRowClear(grid)
+  local B = stk.board
+  local rule = perColor(stage.clearRule) or "crushed"
+  local r
+  if rule == "tetris" then
+    for row = B.rows - 1, 0, -1 do
+      if rowFull(row, grid, rule) then r = row break end
+    end
+  elseif rowFull(B.rows - 1, grid, rule) then
+    r = B.rows - 1
+  end
+  if not r then return false end
+  local seen = {}
+  for i = 0, B.cols - 1 do
+    local p = grid[r * B.cols + i]
+    grid[r * B.cols + i] = nil
+    if not seen[p] then
+      seen[p] = true
+      for j = #p.cells, 1, -1 do
+        if p.fy + p.cells[j][2] == r then
+          p.bubbles[j].gone = true
+          if not p.bubbles[j].popped then p.left = p.left - 1 end
+          table.remove(p.cells, j)
+          table.remove(p.bubbles, j)
+        end
+      end
+      if #p.cells > 0 then
+        stackNormalize(p)
+        if p.left <= 0 then stackCrush(p) end              -- 残りの粒を全部潰してあれば銀色に
+      end
+    end
+  end
+  for i = #stk.pieces, 1, -1 do
+    if #stk.pieces[i].cells == 0 then table.remove(stk.pieces, i) end
+  end
+  stk.lines = stk.lines + 1
+  stk.flash = { t = love.timer.getTime(), y = B.y + r * cell }
+  stackFx(view.w / 2, B.y + (r + 0.5) * cell, "LINE! +10", true)
+  stackAddPoints(10)
+  if Sound.playZip then Sound.playZip() end
+  if Sound.playChime then Sound.playChime(1.2) end
+  return true
+end
+
+-- 画面の点 (x, y) にある、潰し切った(銀色の)片
+local function stackCrushedAt(x, y)
+  local B = stk.board
+  for _, p in ipairs(stk.pieces) do
+    if p.crushed then
+      for _, c in ipairs(p.cells) do
+        local cx, cy = B.x + (p.gx + c[1]) * cell, B.y + (p.fy + c[2]) * cell
+        if x >= cx and x < cx + cell and y >= cy and y < cy + cell then return p end
+      end
+    end
+  end
+end
+
+-- 片を時計回りに90度回し、近くでいちばんぴったりはまる所へ動かす(そこから落ちてはまる)
+-- 列ごとに、回した形が入る高さを今の位置から上へ探し、着地したときのすき間・凸凹・高さと
+-- 今の位置からの距離が小さい所を選ぶ。どこにも入らなければ回さない
+local function stackRotate(p)
+  local B = stk.board
+  local grid = {}
+  for _, q in ipairs(stk.pieces) do                          -- ほかの片(落ちている片は2つの段の両方)
+    if q ~= p then
+      for _, c in ipairs(q.cells) do
+        grid[(math.floor(q.fy) + c[2]) * B.cols + q.gx + c[1]] = q
+        grid[(math.ceil(q.fy) + c[2]) * B.cols + q.gx + c[1]] = q
+      end
+    end
+  end
+  local cells = {}
+  for i, c in ipairs(p.cells) do cells[i] = { p.h - 1 - c[2], c[1] } end
+  local t = { cells = cells, w = p.h, h = p.w }
+  local gx0 = p.gx + math.floor((p.w - p.h) / 2)            -- 片の中心がなるべく動かないように
+  local fy0 = math.floor(p.fy + (p.h - p.w) / 2)
+  local top = math.floor(-(B.y - HUD_H) / cell) - t.h       -- これより上には持ち上げない
+  local best, bestScore
+  for x = 0, B.cols - t.w do
+    t.gx = x
+    local row = fy0
+    while row >= top and not stackFits(t, row, grid) do row = row - 1 end
+    if row >= top then
+      local land = stackDrop(t, row, grid)
+      local score = stackBadness(t, land, grid) + math.abs(x - gx0) * 1.2 + (fy0 - row) * 0.8
+      if not bestScore or score < bestScore then bestScore, best = score, { gx = x, row = row } end
+    end
+  end
+  if not best then
+    if Sound.playBoyoon then Sound.playBoyoon(0.4) end      -- 入る所が無いときは「ボヨン」
+    return false
+  end
+  p.cells, p.w, p.h, p.gx = cells, t.w, t.h, best.gx
+  p.fy = best.row
+  p.landed = false                                          -- ここから落ちて、すき間にはまる
+  if Sound.playStretch then Sound.playStretch(false) end     -- 回る「キュッ」
+  return true
+end
+
+-- 粒の画面上の位置を片の位置から決める
+local function stackPlace()
+  local B = stk.board
+  for _, p in ipairs(stk.pieces) do
+    for i, c in ipairs(p.cells) do
+      local b = p.bubbles[i]
+      b.x = B.x + (p.gx + c[1] + 0.5) * cell
+      b.y = B.y + (p.fy + c[2] + 0.5) * cell
+      b.rad = cell * 0.40 * b.sz
+    end
+  end
+end
+
+local function updateStack(dt)
+  local B = stk.board
+  local now = love.timer.getTime()
+  -- 消えた箱の粒を片付ける
+  local gone = false
+  for _, b in ipairs(bubbles) do if b.gone then gone = true break end end
+  if gone then
+    local list = {}
+    for _, b in ipairs(bubbles) do if not b.gone then list[#list + 1] = b end end
+    bubbles = list
+  end
+  for i = #stk.fx, 1, -1 do
+    if now - stk.fx[i].t > STACK_FX_SHOW then table.remove(stk.fx, i) end
+  end
+  if not timing or finished then stackPlace() return end
+
+  -- 落ちる速さと片を出す間隔は、時間とともに上がっていく
+  -- 時間制限が無い色は 90 秒ごとに同じだけ上がり続け、270 秒で最高になる(いつかは積もりきる)
+  local ramp = roll.limit < math.huge and roll.limit or (stage.rampTime or 90)
+  local q = clamp(elapsed / ramp, 0, roll.limit < math.huge and 1 or 3)
+
+  -- 落下と着地。積もった片の上で止める。支えが消えた片はまた落ちる
+  -- grid には積もっている片の粒をすべて入れておき、片が落ち始めたら外し、着地したら入れる
+  -- (片どうしが組み合わさっていると「下にある順」だけでは支えを決められないため)
+  local v = (stage.fallFrom + (stage.fallTo - stage.fallFrom) * q) / cell   -- 段/秒
+  table.sort(stk.pieces, function(a, b) return a.fy + a.h > b.fy + b.h end)
+  local grid = {}
+  local function mark(p, val)
+    for _, c in ipairs(p.cells) do grid[(p.fy + c[2]) * B.cols + p.gx + c[1]] = val end
+  end
+  for _, p in ipairs(stk.pieces) do
+    if p.landed then mark(p, p) end
+  end
+  for _, p in ipairs(stk.pieces) do
+    local target = math.floor(p.fy + 1e-6)
+    -- 落ちている途中の片は2つの段にまたがる。上の段に別の片が着地したばかりなら下の段から数える
+    if not p.landed and not stackFits(p, target, grid) and stackFits(p, target + 1, grid) then
+      target = target + 1
+    end
+    target = stackDrop(p, target, grid)
+    if p.landed and target > p.fy then
+      p.landed = false
+      mark(p, nil)
+    end
+    if not p.landed then
+      p.fy = p.fy + v * dt
+      if p.fy >= target then
+        p.fy, p.landed = target, true
+        mark(p, p)
+        if not p.everLanded then
+          p.everLanded = true
+          Sound.playSpring(0.35)                           -- 着地の「トン」
+        end
+      end
+    end
+  end
+
+  local cleared = stackRowClear(grid)                         -- 消えた列があれば grid は古いので、片を出すのは次のコマで
+
+  -- 積もった箱が最上段に届いたらゲームオーバー
+  for _, p in ipairs(stk.pieces) do
+    if p.landed and p.fy <= 0 then stk.over = true end
+  end
+
+  -- 新しい片を出す。時間とともに間隔が短くなる
+  if not stk.over and not cleared and elapsed >= stk.nextAt then
+    if stackSpawn(grid) then
+      local s0, s1 = perColor(stage.spawnFrom), perColor(stage.spawnTo)
+      stk.nextAt = elapsed + math.max(0.6, s0 + (s1 - s0) * q)
+    else
+      stk.nextAt = elapsed + 0.2
+    end
+  end
+  stackPlace()
+end
+
 local function newSheet()
-  calcRows()
   bubbles = {}
   pending = {}
-  for r = 1, rows do
-    local c0 = (r % 2 == 0) and 0 or 1              -- 偶数行は両端(c=0, c=cols)に半割の粒が入る
-    for c = c0, stage.cols do
-      local hard = love.math.random() < stage.hardRatio
-      local b = {
-        c = c, r = r,
-        press = 0,
-        -- 粒ごとの「潰れにくさ」。伸びる粒は素早いなぞりでは潰れない。softPop のステージは軽く触れるだけで潰れる
-        thresh = hard and rand(1.2, 1.8) or (stage.softPop and rand(0.30, 0.50) or rand(0.6, 1.1)),
-        hard = hard,
-        speed = rand(0.7, 1.3),                    -- 粒ごとの押し込み速度の個体差
-        seed = rand(0, 100),                       -- 押し込み速度の時間変化用
-        held = false, stretched = false,
-        dwell = 0,                                 -- 今回の接触で押し続けた時間
-        wobA = 0, wobT = 10,                       -- 離したときの揺れ
-        popped = false, t = 0,
-        snd = love.math.random(Sound.NUM_VARIANTS),
-        sz = rand(0.97, 1.03),                     -- 大きさの個体差
-        tint = rand(-0.03, 0.03),                  -- 色味の個体差
-        hx = rand(-0.35, 0.35), hy = rand(-0.35, 0.35),  -- 破裂後の穴の位置
-        wr = {},                                   -- 破裂後のしわ(少なめ・太め・柔らかく)
-        -- 潰れ方の種類(popFx のステージだけ): 1=輪 2=火花 3=空気のもや 4=星
-        fx = stage.popFx and love.math.random(4) or 1,
-        -- 虹色のシート(rainbow のステージだけ): 行ごとに色相を少しずつずらす
-        col = stage.rainbow and hsv((r * 0.045 + c * 0.012) % 1, 0.42, 1) or nil,
-      }
-      for i = 1, 5 do
-        local a, d = rand(0, 2 * pi), rand(0.1, 0.7)
-        local x1, y1 = math.cos(a) * d, math.sin(a) * d
-        b.wr[i] = { x1, y1, x1 + rand(-0.4, 0.4), y1 + rand(-0.4, 0.4) }
+  if not isStack() then
+    calcRows()
+    for r = 1, rows do
+      local c0 = (r % 2 == 0) and 0 or 1              -- 偶数行は両端(c=0, c=cols)に半割の粒が入る
+      for c = c0, stage.cols do
+        bubbles[#bubbles + 1] = makeBubble(c, r)
       end
-      bubbles[#bubbles + 1] = b
     end
   end
   local k = stage.free and 1 or 3                  -- シートが長いほど筋やしわを増やす
@@ -360,7 +850,7 @@ local function newSheet()
   finished, finishInfo = false, nil
   entering, initials, entryRank = false, "", nil
   scrollY, edgeDir, sy0 = 0, 0, nil
-  layout()
+  if isStack() then stackInit() else layout() end   -- 積もるシートは空の枠から始まる
   popped, total = 0, 0                             -- 半割の粒は数えない
   for _, b in ipairs(bubbles) do
     if not b.cut then total = total + 1 end
@@ -430,8 +920,6 @@ local function addCombo(b)
   return 0.9 * 2 ^ (math.min(roll.combo - 1, 12) / 12)
 end
 
--- 全部潰したときの紙吹雪(spawnConfetti)は下で定義する。達成表示からも使うので先に名前だけ用意する
-local spawnConfetti
 
 -- エンドレスロール: 潰した粒の音のおまけと、50個ごとの達成表示(100個ごとは大きく)
 local function endlessPop(b, pitch)
@@ -448,10 +936,11 @@ end
 local function pop(b)
   b.popped, b.t = true, 0
   popped = popped + 1
-  local pitch = isEndless() and addCombo(b) or nil
+  local pitch = (isEndless() or isStack()) and addCombo(b) or nil   -- 続けて潰すと音が高くなる
   Sound.playPop(b.snd, pitch)
   if isEndless() then endlessPop(b, pitch) end
   if isRoller() then rollerSettle(b, true) end
+  if isStack() then stackPop(b, pitch) end
 end
 
 ---------------------------------------------------------------
@@ -519,7 +1008,7 @@ local function enterStage(i)
   scene = "play"
   updateView()
   fingerPress, fingerPressV = 0, 0
-  Sound.setPitchScale(stage.soundPitch or 1)     -- 大粒は低く長く、小粒は高く短く
+  Sound.setPitchScale(perColor(stage.soundPitch) or 1)     -- 大粒は低く長く、小粒は高く短く
   if stage.mode and Sound.prepareJingles then Sound.prepareJingles() end   -- ブザーとファンファーレ
   newSheet()
   love.mouse.setVisible(not useFinger())          -- 指のカーソルを使うステージでは本物のカーソルを隠す
@@ -675,11 +1164,15 @@ function love.mousepressed(x, y, button)
     if love.timer.getTime() - finishAt > FINISH_LOCK then newSheet() end   -- 終わったらクリックで再挑戦
     return
   end
-  if isRoller() and not timing and pointIn(startButtonRect(), mx, sy) then
+  if needsStart() and not timing and pointIn(startButtonRect(), mx, sy) then
     timing = true                                       -- 開始ボタン: 送りと時間の計測を始める
     return
   end
   if sy < touchTop() or sy > touchBottom() then return end
+  if isStack() and perColor(stage.rotate) then                -- 潰し切った箱は1タッチで90度回る(Pink)
+    local p = stackCrushedAt(mx, sy)
+    if p then stackRotate(p) return end
+  end
   local b = hit(mx, sy + scrollY)
   if b and not b.popped then
     b.press = b.press + rand(0.45, 0.75)              -- 素早いタップでも力が積み重なる(実機のタップに合わせて強めに)
@@ -778,13 +1271,17 @@ end
 
 -- ローラー送り: シートを下へ送る(scrollY が減るほどシートは下へ動く)。
 -- 位置は経過時間から直接決めるので、1コマの長さがばらついても進み方は滑らか
-local function updateRoller(dt)
+local function updateConfetti(dt)
   for _, c in ipairs(roll.confetti) do              -- 紙吹雪(終わったあとも動かす)
     c.sway = c.sway + dt * 3
     c.x = c.x + (c.vx + math.sin(c.sway) * 30) * dt
     c.y = c.y + c.vy * dt
     c.a = c.a + c.va * dt
   end
+end
+
+local function updateRoller(dt)
+  updateConfetti(dt)
   if not timing or finished then return end
   local prev = scrollY
   -- elapsed はこのあと love.update の中で dt だけ進むので、進んだあとの時刻で位置を決める
@@ -802,21 +1299,31 @@ local function updateRoller(dt)
   end
 end
 
+-- ステージごとの動き(love.update は LuaJIT の upvalue 上限 60 に近いので、ここにまとめる)
+local function updateMode(dt)
+  if isRoller() then updateRoller(dt)
+  elseif isStack() then updateConfetti(dt) updateStack(dt) end
+end
+
 -- ステージの終わり。2つ目の戻り値が true のときは記録しない。
 -- ローラー送りは、時間内に全部潰したら「クリア」(ファンファーレ・記録あり)、
 -- 制限時間になったら「時間切れ」(ブザー・記録なし)。それ以外のステージは全部潰したら終わり
 local function stageDone()
-  if not isRoller() then return total > 0 and popped >= total, false end
-  if roll.result then return true, roll.result == "timeup" end
-  if isEndless() then
-    -- エンドレスロール: 制限時間で終わり、潰した個数を記録する。自己ベストを超えたらお祝い
-    if elapsed < roll.limit then return false, false end
-    elapsed = roll.limit
-    roll.result = "end"
+  if isEndless() or isStack() then
+    -- エンドレスロール・積もるシート: 制限時間で終わり、個数(点数)を記録する。自己ベストを超えたらお祝い
+    if roll.result then return true, false end
+    if isStack() and stk.over then
+      roll.result = "over"                                   -- 積もるシート: 最上段に届いたらゲームオーバー
+    else
+      if elapsed < roll.limit then return false, false end
+      elapsed = roll.limit
+      roll.result = "end"
+    end
+    local v = recordValue()
     local best = Records.best(recId())
-    if popped > 0 and (not best or popped > best) then
+    if v > 0 and (not best or v > best) then
       roll.clearAt = love.timer.getTime()
-      roll.celebrate = { title = "NEW RECORD!", sub = popped .. " pops!" }
+      roll.celebrate = { title = "NEW RECORD!", sub = v .. (isStack() and " points!" or " pops!") }
       spawnConfetti()
       if Sound.playFanfare then Sound.playFanfare() end
     elseif Sound.playBuzzer then
@@ -824,6 +1331,8 @@ local function stageDone()
     end
     return true, false
   end
+  if not isRoller() then return total > 0 and popped >= total, false end
+  if roll.result then return true, roll.result == "timeup" end
   if total > 0 and popped >= total then
     roll.result = "clear"
     roll.clearAt = love.timer.getTime()
@@ -871,7 +1380,7 @@ function love.update(dt)
   end
   sy0 = sy
 
-  if isRoller() then updateRoller(dt) end
+  updateMode(dt)
 
   local wy = sy + scrollY                          -- シート上の座標
 
@@ -1273,7 +1782,10 @@ local function drawFinishPanel()
   local rec = stage.record
   local lh = msgFont:getHeight()
   local items = { { text = "All popped!  " .. fmtTime(elapsed) } }
-  if isEndless() then                                           -- エンドレスロール: 潰した個数と最大コンボ
+  if isStack() then                                             -- 積もるシート: 点数と、消した片・AIR ボーナスの内訳
+    items = { { text = roll.result == "over" and "GAME OVER" or "TIME UP!" }, { text = "Score " .. stk.score },
+              { text = string.format("Lines %d   Air %d   Max combo %d", stk.lines, stk.air, roll.maxCombo) } }
+  elseif isEndless() then                                       -- エンドレスロール: 潰した個数と最大コンボ
     items = { { text = "TIME UP!" },
               { text = string.format("Popped %d   Max combo %d", popped, roll.maxCombo) } }
   elseif isRoller() and roll.result == "timeup" then           -- ローラー送りの時間切れ: 潰した数と割合
@@ -1358,7 +1870,7 @@ local function drawEntryPanel()
   love.graphics.setColor(0.2, 0.3, 0.4)
   love.graphics.printf("NEW RANK #" .. tostring(entryRank) .. "!", L.px, L.py + 16, L.bw, "center")
   local v = recordValue()
-  love.graphics.printf(isScoreStage(stage) and (v .. " pops") or fmtTime(v), L.px, L.py + 16 + L.lh, L.bw, "center")
+  love.graphics.printf(isScoreStage(stage) and (v .. (isStack() and " points" or " pops")) or fmtTime(v), L.px, L.py + 16 + L.lh, L.bw, "center")
 
   love.graphics.setFont(hudFont)
   for i, s in ipairs(L.slots) do                                  -- 桁ごとの上下ボタンと文字
@@ -1490,7 +2002,7 @@ local function drawMilestone()
   if t > MILESTONE_SHOW then return end
   local fade = math.min(1, (MILESTONE_SHOW - t) / 0.4)
   local k = (m.big and 1.25 or 1.0) * (1 + 0.7 * math.max(0, 1 - t / 0.2)) * (1 + 0.04 * math.sin(t * 10))
-  local text = m.n .. " POPS!"
+  local text = m.n .. (m.unit or " POPS!")
   love.graphics.setFont(titleFont)
   local tw, th = titleFont:getWidth(text), titleFont:getHeight()
   love.graphics.push()
@@ -1547,8 +2059,88 @@ local function drawRollers()
   drawRoller(ROLL_BOT_CY, rBot, roll.phBot, false)
 end
 
-local function drawPlay()
-  -- シート(スクロールする層)
+---------------------------------------------------------------
+-- 描画: 積もるシート(Lv2-3)
+---------------------------------------------------------------
+-- 粒の入った箱: 角を丸くし、上を明るく下を暗くして立体的に見せる
+local function drawBox(x, y, col)
+  local s = cell
+  local m = s * 0.05                                            -- 箱どうしのすき間
+  local w = s - 2 * m
+  local rr = s * 0.20                                           -- 角の丸み
+  local bev = math.max(3, s * 0.09)                             -- 下側の厚み
+  x, y = x + m, y + m
+  love.graphics.setColor(0.1, 0.15, 0.3, 0.18)                  -- 影
+  love.graphics.rectangle("fill", x + 2, y + 4, w, w, rr, rr)
+  love.graphics.setColor(col[1] * 0.72, col[2] * 0.72, col[3] * 0.80, 1)   -- 側面(暗い)
+  love.graphics.rectangle("fill", x, y, w, w, rr, rr)
+  love.graphics.setColor(col[1], col[2], col[3], 1)             -- 上面
+  love.graphics.rectangle("fill", x, y, w, w - bev, rr, rr)
+  love.graphics.setColor(1, 1, 1, 0.22)                         -- 上面の柔らかい光
+  love.graphics.rectangle("fill", x + w * 0.08, y + w * 0.06, w * 0.84, (w - bev) * 0.45, rr * 0.8, rr * 0.8)
+  love.graphics.setColor(1, 1, 1, 0.70)                         -- 上の縁の光
+  love.graphics.setLineWidth(math.max(1.5, s * 0.03))
+  love.graphics.line(x + rr, y + 2, x + w - rr, y + 2)
+  love.graphics.setColor(col[1] * 0.55, col[2] * 0.55, col[3] * 0.65, 0.9)   -- 輪郭
+  love.graphics.setLineWidth(1.2)
+  love.graphics.rectangle("line", x, y, w, w, rr, rr)
+end
+
+local function drawStack()
+  local B = stk.board
+  local now = love.timer.getTime()
+  -- 片が積もる枠(井戸)と、うっすらした列の線
+  love.graphics.setColor(1, 1, 1, 0.30)
+  love.graphics.rectangle("fill", B.x - 6, B.y, B.w + 12, B.h + 6, 8, 8)
+  love.graphics.setColor(0.5, 0.6, 0.85, 0.12)
+  love.graphics.setLineWidth(1)
+  for i = 1, B.cols - 1 do
+    love.graphics.line(B.x + i * cell, B.y + 4, B.x + i * cell, B.y + B.h - 4)
+  end
+  love.graphics.setColor(0.5, 0.65, 0.9, 0.55)
+  love.graphics.setLineWidth(2)
+  love.graphics.line(B.x - 6, B.y, B.x - 6, B.y + B.h + 6, B.x + B.w + 6, B.y + B.h + 6, B.x + B.w + 6, B.y)
+  love.graphics.setColor(0.95, 0.35, 0.35, 0.45)                -- 最上段の線(ここまで積もるとゲームオーバー)
+  for x = B.x, B.x + B.w - 8, 16 do love.graphics.line(x, B.y + cell, x + 8, B.y + cell) end
+
+  setScissor(B.x - 6, HUD_H, B.w + 12, B.y + B.h + 6 - HUD_H)
+  for _, p in ipairs(stk.pieces) do
+    for _, c in ipairs(p.cells) do
+      drawBox(B.x + (p.gx + c[1]) * cell, B.y + (p.fy + c[2]) * cell, p.col)
+    end
+    for _, b in ipairs(p.bubbles) do
+      if b.popped then drawPopped(b) else drawIntact(b) end
+    end
+  end
+  local f = stk.flash                                             -- 最下列が消えたときの光
+  if f and now - f.t < STACK_FLASH then
+    local q = (now - f.t) / STACK_FLASH
+    love.graphics.setColor(1, 1, 1, 0.9 * (1 - q))
+    love.graphics.rectangle("fill", B.x - 6, f.y - cell * 0.3 * q, B.w + 12, cell * (1 + 0.6 * q), 10, 10)
+  end
+  love.graphics.setScissor()
+
+  -- 「AIR! +5」「LINE! +10」の文字
+  love.graphics.setFont(msgFont)
+  for _, fx in ipairs(stk.fx) do
+    local q = (now - fx.t) / STACK_FX_SHOW
+    local tw = msgFont:getWidth(fx.text)
+    local x = clamp(fx.x, tw / 2 + 8, view.w - tw / 2 - 8)
+    local y = math.max(HUD_H + 16, fx.y - 50 * q)
+    local k = 1.3 * (1 + 0.4 * math.max(0, 1 - q / 0.15))
+    love.graphics.push()
+    love.graphics.translate(x, y)
+    love.graphics.scale(k)
+    love.graphics.setColor(0.2, 0.3, 0.45, 0.5 * (1 - q))
+    love.graphics.print(fx.text, -tw / 2 + 2, -msgFont:getHeight() / 2 + 2)
+    love.graphics.setColor(1, 0.7, 0.15, 1 - q)                   -- 金色
+    love.graphics.print(fx.text, -tw / 2, -msgFont:getHeight() / 2)
+    love.graphics.pop()
+  end
+end
+
+-- シート(スクロールする層)
+local function drawSheetLayer()
   setScissor(0, clipTop(), view.w, clipBottom() - clipTop())
   love.graphics.push()
   love.graphics.translate(0, -scrollY)
@@ -1566,6 +2158,10 @@ local function drawPlay()
   love.graphics.pop()
   love.graphics.setScissor()
   if isRoller() then drawRollers() end
+end
+
+local function drawPlay()
+  if isStack() then drawStack() else drawSheetLayer() end
 
   if scrollY > 1 and not isRoller() then                         -- 上部の表示エリアの下に薄い影
     for i = 0, 7 do
@@ -1580,12 +2176,14 @@ local function drawPlay()
   love.graphics.setColor(crgb[1], crgb[2], crgb[3], 1)
   love.graphics.circle("fill", 22, 27, 6)
   love.graphics.setColor(0.2, 0.3, 0.4)
-  if isEndless() then                                              -- エンドレスロールは潰した個数だけ
+  if isStack() then                                                -- 積もるシートは点数
+    love.graphics.print("Score " .. stk.score, 36, 18)
+  elseif isEndless() then                                          -- エンドレスロールは潰した個数だけ
     love.graphics.print(popped .. " pops", 36, 18)
   else
     love.graphics.print(string.format("%d / %d", popped, total), 36, 18)
   end
-  local shown = isRoller() and math.max(0, roll.limit - elapsed) or elapsed   -- ローラー送りは残り時間
+  local shown = (needsStart() and roll.limit < math.huge) and math.max(0, roll.limit - elapsed) or elapsed   -- 制限時間のあるステージは残り時間
   love.graphics.printf(fmtTime(shown), 0, 18, view.w, "center")
   if stage.record then
     local best = Records.best(recId())
@@ -1595,7 +2193,7 @@ local function drawPlay()
   end
 
   drawScrollbar()
-  if isRoller() and not timing and not finished then            -- 開始ボタンか粒に触れるまでシートは止まって待つ
+  if needsStart() and not timing and not finished then          -- 開始ボタンか粒に触れるまでシートは止まって待つ
     love.graphics.setFont(msgFont)
     local r = startButtonRect()
     love.graphics.setColor(0.35, 0.65, 0.95, 1)
@@ -1607,13 +2205,13 @@ local function drawPlay()
     love.graphics.printf(START_LABEL, r.x, r.y + (r.h - msgFont:getHeight()) / 2, r.w, "center")
   end
   if not entering then drawBar() end                              -- 入力中はうっかり押さないよう隠す
-  if isEndless() then drawComboFx() drawMilestone() end
-  if isRoller() and roll.celebrate then drawCelebration() elseif isEndless() then drawConfetti() end
+  if isEndless() or isStack() then drawComboFx() drawMilestone() end
+  if needsStart() and roll.celebrate then drawCelebration() elseif isEndless() or isStack() then drawConfetti() end
   if entering then drawEntryPanel() elseif finished then drawFinishPanel() end
 
   if useFinger() then                                            -- 指のカーソル(いちばん手前)
     local mx, sy = mousePos()
-    Finger.draw(mx, sy, fingerPress, stage.fingerScale)
+    Finger.draw(mx, sy, fingerPress, perColor(stage.fingerScale))
   end
 end
 

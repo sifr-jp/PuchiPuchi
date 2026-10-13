@@ -30,6 +30,17 @@
 --   rainbow     true: シートを虹色にする
 --   bg          背景色 { r, g, b }。省略時はいつもの水色
 --   milestone   この個数ごとに達成表示とジングル(その2倍ごとは大きく)
+--               "stack": 積もるシート(Lv2-3)。粒の入った箱(片)が落ちてきて積もる。最上段に届いたらゲームオーバー
+--   clearRule   mode = "stack" で最下列の箱が消える条件。"crushed": 粒を全部潰した(銀色の)箱ですき間なく埋まる
+--               "color": 同じ色の箱で埋まる / "any": どの箱でも埋まれば消える
+--               "tetris": どの段でも、横一列が箱で埋まれば消える(潰したかは問わない)。色ごとの表にできる
+--   rotate      mode = "stack" で true の色は、潰し切った(銀色の)箱を1タッチで90度回せる。色ごとの表
+--   spawnTries  mode = "stack" で片を出す場所を何か所試すか(いちばん低く着地する所に出す)
+--   time        mode = "stack" で色を省くと、その色は時間制限なし
+--   cols        mode = "stack" では色ごとの表にできる(枠の横の粒の数。少ないほど大粒)
+--   fallFrom    mode = "stack" の片の落ちる速さ(px/秒)。fallTo まで時間とともに上がる
+--   spawnFrom   mode = "stack" の片を出す間隔(秒)。spawnTo まで時間とともに短くなる
+--   soundPitch, fingerScale も色ごとの表にできる
 
 -- 潰せる粒の数: 奇数行は cols 個、偶数行は両端が半割なので (cols - 1) 個
 local function count(cols, rows)
@@ -86,6 +97,22 @@ return {
     time = { blue = 60, yellow = 90, pink = 120 },
     speedFrom = { blue = 22, yellow = 22, pink = 22 },
     speedTo = { blue = 45, yellow = 60, pink = 75 },
+    finger = true, scroll = false,
+    record = { n = 3, initials = true, score = true },
+  },
+  {
+    id = "2-3", title = "Lv2-3  Stack", level = 2, mode = "stack",
+    sub = "Crush & clear lines  /  50, 100...",
+    free = false, cols = { blue = 5, yellow = 7, pink = 9 }, maxCell = 96,   -- 大粒 / 中粒 / 小粒
+    hardRatio = 0, pressTime = 0.10, softPop = true, popFx = true, milestone = 50,
+    clearRule = { blue = "crushed", yellow = "tetris", pink = "crushed" },   -- Yellow だけテトリス式
+    rotate = { pink = true },                                   -- Pink だけ、潰し切った箱を1タッチで90度回せる
+    time = { blue = 90, yellow = 90 },                          -- Pink は時間制限なし(ゲームオーバーまで)
+    fallFrom = 70, fallTo = 130, spawnTries = 4,
+    spawnFrom = { blue = 3.0, yellow = 2.4, pink = 2.2 }, spawnTo = { blue = 2.0, yellow = 1.6, pink = 1.4 },
+    soundPitch = { blue = 0.75, yellow = 1.0, pink = 1.25 },
+    fingerScale = { blue = 1.3, yellow = 1.0, pink = 0.8 },
+    bg = { 0.92, 0.91, 0.98 },
     finger = true, scroll = false,
     record = { n = 3, initials = true, score = true },
   },
