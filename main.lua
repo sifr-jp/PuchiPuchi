@@ -42,6 +42,10 @@
 --   v2.7: Lv2-3 Yellow だけ消え方をテトリス式に(どの段でも横一列が箱で埋まれば消える。潰したかは問わない)
 --   v2.8: Lv2-3 Pink だけ、潰し切った(銀色の)箱を1タッチで時計回りに90度回せる
 --   v2.9: 回した箱は、近くでいちばんぴったり入るすき間を探して、そこへ落ちてはまる
+--   v2.10: Lv2-4 迷路。迷路の描かれたシートが下へ流れる。いまの位置(丸い印)の隣の粒を潰すと、そこへ進む。
+--         いちばん上の GOAL の段に着けばクリア(記録はタイム)。いまの位置が下端まで流されたらゲームオーバー。
+--         潰した粒に触れると、そこへ引き返せる。行き止まりに隠れたボーナス粒を潰すと、位置が1段か3段上がる。
+--         ゴールまで Blue 50段 / Yellow 100段 / Pink 200段。速く進むと、シートもそれに合わせて速く送られる
 
 local Sound = require("sound")
 local Records = require("records")
@@ -81,11 +85,6 @@ local CONFETTI_N = 140          -- 全部潰したときの紙吹雪の数
 local COMBO_GAP = 0.9           -- エンドレスロール: この時間(秒)以内に次を潰すとコンボが続く
 local COMBO_SHOW = 0.8          -- コンボの文字が浮かんで消えるまでの時間(秒)
 local MILESTONE_SHOW = 1.6      -- 「50 POPS!」などの達成表示が出ている時間(秒)
-
--- 積もるシート(Lv2-3)
-local STACK_BOTTOM_GAP = 14     -- 片が積もる枠の下端と、MENU/RESET帯とのすき間
-local STACK_FX_SHOW = 0.9       -- 「AIR! +5」「LINE! +10」の文字が浮かんで消えるまでの時間(秒)
-local STACK_FLASH = 0.35        -- 最下列が消えたときに光る時間(秒)
 
 ---------------------------------------------------------------
 -- 状態
@@ -148,8 +147,21 @@ local roll = { start = 0, speed = 30, limit = 60, missed = 0, rowLeft = {}, phTo
 --   lines: 消した列の数 / air: 着地前に潰し切った片の数 / score: 点数(1粒1点、AIR +5、列 +10)
 --   nextAt: 次の片を出す時刻(経過時間) / nextMs: 次の達成表示の点数 / over: ゲームオーバー
 --   flash: 最下列が消えた光 { t, y } / fx: 浮かぶ文字 { x, y, t, text, air }
-local stk = { board = { x = 0, y = 0, w = 0, h = 0, cols = 5, rows = 7 }, pieces = {},
+--   (main.lua のトップレベルのローカル変数は LuaJIT の上限 200 に近いので、調整用の定数もこの表に入れる)
+--   BOTTOM_GAP: 片が積もる枠の下端と、MENU/RESET帯とのすき間
+--   FX_SHOW: 「AIR! +5」「LINE! +10」の文字が浮かんで消えるまでの時間(秒) / FLASH: 最下列が消えたときに光る時間(秒)
+local stk = { BOTTOM_GAP = 14, FX_SHOW = 0.9, FLASH = 0.35,
+              board = { x = 0, y = 0, w = 0, h = 0, cols = 5, rows = 7 }, pieces = {},
               lines = 0, air = 0, score = 0, nextAt = 0, nextMs = 50, over = false, flash = nil, fx = {} }
+
+-- 迷路(Lv2-4)の状態と関数。トップレベルのローカル変数を増やさないよう、関数もこの表に入れる
+--   FOLLOW_Y: いまの位置がこの高さより上へ行くと、シートを余分に送って追いかける(速く進むほど速く送られる)
+--   START_Y: 開始時の、スタートの段の高さ / DANGER: 下端までこの段数を切ると印が赤く点滅する
+--   LIFT_SPEED: ボーナスで位置が上がる速さ(px/秒) / FX_SHOW: 「UP +3」の文字が出ている時間(秒)
+--   grid[r][c]: 粒 / up[r][c]: 上の段へ通れる / rt[r][c]: 右の列へ通れる(r = 1 がゴールの段、r = rows がスタートの段)
+--   cur: いまの位置の粒 / lift: ボーナスでまだ上がり切っていない量(px) / goal, over: ゴールした / 流された
+local mz = { FOLLOW_Y = 420, START_Y = 560, DANGER = 1.6, LIFT_SPEED = 260, FX_SHOW = 1.0,
+             grid = {}, up = {}, rt = {}, cur = nil, lift = 0, goal = false, over = false, fx = {}, bonuses = 0 }
 
 -- 紙吹雪(spawnConfetti)は下で定義する。達成表示からも使うので先に名前だけ用意する
 local spawnConfetti
@@ -166,6 +178,16 @@ end
 -- 積もるシート(Lv2-3)
 local function isStack()
   return stage ~= nil and stage.mode == "stack"
+end
+
+-- 迷路(Lv2-4)。main.lua のトップレベルのローカル変数は LuaJIT の上限(200)に近いので、表 mz に入れる
+function mz.on()
+  return stage ~= nil and stage.mode == "maze"
+end
+
+-- 上下にローラーのあるステージ(ローラー送り・エンドレスロール・迷路)
+function mz.rollers()
+  return isRoller() or mz.on()
 end
 
 -- 開始ボタン(TAP TO START)を押すまで待つステージ
@@ -284,16 +306,16 @@ local function playBottom()
 end
 
 -- シートが見える範囲(上端・下端)。ローラー送りでは上下のローラーの中心で切る。積もるシートは枠の下端まで
-local function clipTop() return isRoller() and ROLL_TOP_CY or HUD_H end
+local function clipTop() return mz.rollers() and ROLL_TOP_CY or HUD_H end
 local function clipBottom()
   if isStack() then return stk.board.y + stk.board.h end
-  return isRoller() and ROLL_BOT_CY or playBottom()
+  return mz.rollers() and ROLL_BOT_CY or playBottom()
 end
 -- 粒に触れられる範囲(上端・下端)
-local function touchTop() return isRoller() and ROLL_TOUCH_TOP or HUD_H end
+local function touchTop() return mz.rollers() and ROLL_TOUCH_TOP or HUD_H end
 local function touchBottom()
   if isStack() then return stk.board.y + stk.board.h end
-  return isRoller() and ROLL_TOUCH_BOT or playBottom()
+  return mz.rollers() and ROLL_TOUCH_BOT or playBottom()
 end
 
 ---------------------------------------------------------------
@@ -420,7 +442,7 @@ local function stackLayout()
   local B = stk.board
   B.cols = perColor(stage.cols)
   cell = math.min((view.w - 2 * MARGIN) / B.cols, stage.maxCell or 96)
-  local bottom = playBottom() - STACK_BOTTOM_GAP
+  local bottom = playBottom() - stk.BOTTOM_GAP
   B.rows = math.floor((bottom - HUD_H - 8) / cell)
   B.w, B.h = B.cols * cell, B.rows * cell
   B.x = (view.w - B.w) / 2
@@ -758,7 +780,7 @@ local function updateStack(dt)
     bubbles = list
   end
   for i = #stk.fx, 1, -1 do
-    if now - stk.fx[i].t > STACK_FX_SHOW then table.remove(stk.fx, i) end
+    if now - stk.fx[i].t > stk.FX_SHOW then table.remove(stk.fx, i) end
   end
   if not timing or finished then stackPlace() return end
 
@@ -822,10 +844,217 @@ local function updateStack(dt)
   stackPlace()
 end
 
+---------------------------------------------------------------
+-- 迷路(Lv2-4): 迷路の描かれたシートが下へ流れる。いまの位置の隣の粒を潰して、上のゴールまで進む
+---------------------------------------------------------------
+-- 迷路を作る。粒は四角く並べ、粒と粒のあいだに壁の線を引く
+-- 段を band 段ずつの帯に分け、帯の中はどの粒へも道が1本だけ通じる迷路にする。
+-- 帯と帯は links か所だけでつながるので、行き止まりの深さは帯の高さまで(画面に見えている範囲で先が読める)
+-- 帯に下から入って上へ抜けるまでの道のりは maxPath 粒まで(長すぎると、正しく進んでも下端に追いつかれるため)
+function mz.generate(cols, nrows, band, links, twist, maxPath)
+  local up, rt = {}, {}
+  local need = nil                                           -- 1つ上の帯の、いちばん下の段の各列から出口までの道のり
+  for r = 1, nrows do up[r], rt[r] = {}, {} end
+  for c = 1, cols - 1 do rt[1][c] = true end                 -- ゴールの段は横に全部つながっている
+  local r0 = 2
+  while r0 <= nrows do
+    local r1 = math.min(nrows, r0 + band - 1)
+    -- 帯の中を掘り進む。掘りかけの粒のうち、いちばん新しい粒から伸ばすと長くうねった道に、
+    -- でたらめに選んだ粒から伸ばすと短い枝の多い道になる(twist がその割合。大きいほど道が長くうねる)
+    local seen = {}
+    local stack = { { love.math.random(cols), love.math.random(r0, r1) } }
+    seen[stack[1][2] * 100 + stack[1][1]] = true
+    while #stack > 0 do
+      local k = love.math.random() < twist and #stack or love.math.random(#stack)
+      local c, r = stack[k][1], stack[k][2]
+      local opts = {}
+      if r > r0 and not seen[(r - 1) * 100 + c] then opts[#opts + 1] = { c, r - 1 } end
+      if r < r1 and not seen[(r + 1) * 100 + c] then opts[#opts + 1] = { c, r + 1 } end
+      if c > 1 and not seen[r * 100 + c - 1] then opts[#opts + 1] = { c - 1, r } end
+      if c < cols and not seen[r * 100 + c + 1] then opts[#opts + 1] = { c + 1, r } end
+      if #opts == 0 then
+        table.remove(stack, k)
+      else
+        local n = opts[love.math.random(#opts)]
+        if n[2] == r - 1 then up[r][c] = true
+        elseif n[2] == r + 1 then up[r + 1][c] = true
+        elseif n[1] == c - 1 then rt[r][c - 1] = true
+        else rt[r][c] = true end
+        seen[n[2] * 100 + n[1]] = true
+        stack[#stack + 1] = n
+      end
+    end
+    -- 上の帯(またはゴールの段)への出口。上の帯に入ってからの道のりが maxPath 以内になる列から選ぶ
+    -- (そういう列が無ければ、いちばん近い列)。2か所以上のときは、なるべく離す
+    local first = love.math.random(cols)
+    if need then
+      local ok, best = {}, 1
+      for c = 1, cols do
+        if need[c] <= maxPath then ok[#ok + 1] = c end
+        if need[c] < need[best] then best = c end
+      end
+      first = #ok > 0 and ok[love.math.random(#ok)] or best
+    end
+    up[r0][first] = true
+    for i = 2, links do
+      local c = (first - 1 + math.floor(cols * (i - 1) / links) + love.math.random(0, 1)) % cols + 1
+      up[r0][c] = true
+    end
+    -- この帯のいちばん下の段の各列から、出口までの道のりを数えておく(下の帯の出口と、スタートの列を決めるのに使う)
+    local dist, queue, head = {}, {}, 1
+    for c = 1, cols do
+      if up[r0][c] then dist[r0 * 100 + c] = 1 queue[#queue + 1] = { c, r0 } end
+    end
+    while queue[head] do
+      local c, r = queue[head][1], queue[head][2]
+      head = head + 1
+      local d = dist[r * 100 + c] + 1
+      local function go(c2, r2, open)
+        if open and not dist[r2 * 100 + c2] then dist[r2 * 100 + c2] = d queue[#queue + 1] = { c2, r2 } end
+      end
+      if r > r0 then go(c, r - 1, up[r][c]) end
+      if r < r1 then go(c, r + 1, up[r + 1][c]) end
+      if c > 1 then go(c - 1, r, rt[r][c - 1]) end
+      if c < cols then go(c + 1, r, rt[r][c]) end
+    end
+    need = {}
+    for c = 1, cols do need[c] = dist[r1 * 100 + c] end
+    r0 = r1 + 1
+  end
+  -- スタートの列: まん中に近く、最初の帯の道のりが maxPath 以内の列
+  local mid, startC = math.ceil(cols / 2), nil
+  for c = 1, cols do
+    if need[c] <= maxPath and (not startC or math.abs(c - mid) < math.abs(startC - mid)) then startC = c end
+  end
+  mz.up, mz.rt, mz.startC = up, rt, startC or mid
+end
+
+-- 粒 a と b が隣どうしで、あいだに壁が無いか
+function mz.linked(a, b)
+  if a.c == b.c then
+    if a.r == b.r + 1 then return mz.up[a.r][a.c] == true end
+    if b.r == a.r + 1 then return mz.up[b.r][b.c] == true end
+  elseif a.r == b.r then
+    if b.c == a.c + 1 then return mz.rt[a.r][a.c] == true end
+    if a.c == b.c + 1 then return mz.rt[b.r][b.c] == true end
+  end
+  return false
+end
+
+-- シート上の点 (mx, wy) にある粒(マス目で探す。粒の丸からはみ出していても、そのマスの粒とする)
+function mz.at(mx, wy)
+  local c = math.floor((mx - sheet.x) / cell) + 1
+  local r = math.floor((wy - sheet.y) / cell) + 1
+  return mz.grid[r] and mz.grid[r][c] or nil
+end
+
+-- 潰せる粒: いまの位置の隣で、壁にさえぎられていない、まだ潰していない粒だけ
+function mz.target(mx, wy)
+  local b = mz.at(mx, wy)
+  if b and not b.popped and mz.cur and mz.linked(mz.cur, b) then return b end
+  return nil
+end
+
+-- 潰した粒に触れたら、そこへ引き返す(潰した粒はすべて道でつながっている)
+function mz.walkTo(mx, wy)
+  local b = mz.at(mx, wy)
+  if b and b.popped and b ~= mz.cur then mz.cur = b end
+end
+
+-- タップしたとき: 引き返すか、壁の向こうや離れた粒なら「ボヨン」と弾むだけ
+function mz.tap(mx, wy)
+  if finished then return end
+  local b = mz.at(mx, wy)
+  if not b then return end
+  if b.popped then
+    mz.walkTo(mx, wy)
+  elseif not (mz.cur and mz.linked(mz.cur, b)) then
+    Sound.playBoyoon(0.3)
+    b.wobA, b.wobT = 0.5, 0
+  end
+end
+
+-- 迷路の粒を作る(newSheet から呼ぶ)
+function mz.build()
+  local cols = stage.cols
+  rows = perColor(stage.rows)
+  cell = math.min((view.w - 2 * MARGIN) / cols, stage.maxCell or 64)
+  mz.generate(cols, rows, perColor(stage.band) or 4, perColor(stage.links) or 1, perColor(stage.twist) or 0.5,
+              perColor(stage.maxPath) or math.huge)
+  mz.grid, mz.bonuses = {}, 0
+  for r = 1, rows do
+    mz.grid[r] = {}
+    for c = 1, cols do
+      local b = makeBubble(c, r)
+      mz.grid[r][c] = b
+      bubbles[#bubbles + 1] = b
+    end
+  end
+end
+
+-- 粒の並びと、開始時の状態(newSheet から呼ぶ)
+function mz.init()
+  local cols = stage.cols
+  local ox = (view.w - cols * cell) / 2
+  for _, b in ipairs(bubbles) do
+    b.x = ox + (b.c - 0.5) * cell
+    b.y = TOP + (b.r - 0.5) * cell
+    b.rad = cell * 0.40 * b.sz
+    b.cut = false
+  end
+  sheet.x, sheet.y = math.floor(ox + 0.5), TOP
+  sheet.w, sheet.h = math.floor(cols * cell + 0.5), rows * cell
+  sheet.wob = { top = makeWob(sheet.w), bottom = makeWob(sheet.w),
+                left = makeWob(sheet.h), right = makeWob(sheet.h) }
+  -- スタートはいちばん下の段のまん中あたり。最初から潰してある
+  local start = mz.grid[rows][mz.startC]
+  start.popped, start.t = true, 10
+  mz.cur = start
+  -- 行き止まりのいくつかに、ボーナス粒を隠す(潰すと位置が1段か3段上がる)
+  local rate = stage.bonusRate or 0.5
+  for r = 2, rows - 1 do
+    for c = 1, cols do
+      local n = (mz.up[r][c] and 1 or 0) + (mz.up[r + 1][c] and 1 or 0)
+              + (mz.rt[r][c] and 1 or 0) + (mz.rt[r][c - 1] and 1 or 0)
+      if n == 1 and love.math.random() < rate then
+        mz.grid[r][c].bonus = love.math.random() < 0.3 and 3 or 1
+        mz.bonuses = mz.bonuses + 1
+      end
+    end
+  end
+  maxScroll = 0
+  roll.start = start.y - mz.START_Y
+  scrollY = roll.start
+  mz.lift, mz.goal, mz.over, mz.fx = 0, false, false, {}
+  roll.limit = math.huge
+  roll.combo, roll.maxCombo, roll.comboAt, roll.comboFx, roll.milestone = 0, 0, -10, nil, nil
+  roll.missed, roll.result, roll.confetti, roll.celebrate = 0, nil, {}, nil
+  roll.phTop, roll.phBot = 0, 0
+end
+
+-- スタートから上がった段数
+function mz.climbed()
+  return mz.cur and (rows - mz.cur.r) or 0
+end
+
+-- 粒を潰したとき(pop から呼ぶ): そこへ進む。ゴールの段ならクリア。ボーナス粒なら位置が上がる
+function mz.pop(b, pitch)
+  if b.fx == 4 and Sound.playChime then Sound.playChime(pitch) end
+  mz.cur = b
+  if b.r == 1 then mz.goal = true end
+  if b.bonus then
+    mz.lift = mz.lift + b.bonus * cell
+    mz.fx[#mz.fx + 1] = { x = b.x, y = b.y, t = love.timer.getTime(), text = "UP +" .. b.bonus }
+    if Sound.playMilestone then Sound.playMilestone(b.bonus >= 3) end
+  end
+end
+
 local function newSheet()
   bubbles = {}
   pending = {}
-  if not isStack() then
+  if mz.on() then
+    mz.build()
+  elseif not isStack() then
     calcRows()
     for r = 1, rows do
       local c0 = (r % 2 == 0) and 0 or 1              -- 偶数行は両端(c=0, c=cols)に半割の粒が入る
@@ -850,7 +1079,7 @@ local function newSheet()
   finished, finishInfo = false, nil
   entering, initials, entryRank = false, "", nil
   scrollY, edgeDir, sy0 = 0, 0, nil
-  if isStack() then stackInit() else layout() end   -- 積もるシートは空の枠から始まる
+  if isStack() then stackInit() elseif mz.on() then mz.init() else layout() end   -- 積もるシートは空の枠から始まる
   popped, total = 0, 0                             -- 半割の粒は数えない
   for _, b in ipairs(bubbles) do
     if not b.cut then total = total + 1 end
@@ -893,6 +1122,7 @@ local function hit(mx, wy)
   if mx < sheet.x or mx > sheet.x + sheet.w or wy < sheet.y or wy > sheet.y + sheet.h then
     return nil                                     -- 切り落とされた部分は触れない
   end
+  if mz.on() then return mz.target(mx, wy) end   -- 迷路: いまの位置の隣の粒だけ
   for _, b in ipairs(bubbles) do
     if not b.missed then                           -- 取りこぼした粒(ローラー送り)はもう触れない
       local dx, dy = mx - b.x, wy - b.y
@@ -936,11 +1166,12 @@ end
 local function pop(b)
   b.popped, b.t = true, 0
   popped = popped + 1
-  local pitch = (isEndless() or isStack()) and addCombo(b) or nil   -- 続けて潰すと音が高くなる
+  local pitch = (isEndless() or isStack() or mz.on()) and addCombo(b) or nil   -- 続けて潰すと音が高くなる
   Sound.playPop(b.snd, pitch)
   if isEndless() then endlessPop(b, pitch) end
   if isRoller() then rollerSettle(b, true) end
   if isStack() then stackPop(b, pitch) end
+  if mz.on() then mz.pop(b, pitch) end
 end
 
 ---------------------------------------------------------------
@@ -1173,6 +1404,7 @@ function love.mousepressed(x, y, button)
     local p = stackCrushedAt(mx, sy)
     if p then stackRotate(p) return end
   end
+  if mz.on() then mz.tap(mx, sy + scrollY) end               -- 潰した粒に触れたら、そこへ引き返す
   local b = hit(mx, sy + scrollY)
   if b and not b.popped then
     b.press = b.press + rand(0.45, 0.75)              -- 素早いタップでも力が積み重なる(実機のタップに合わせて強めに)
@@ -1299,10 +1531,42 @@ local function updateRoller(dt)
   end
 end
 
+-- 迷路(Lv2-4): シートを下へ送る。送りの速さは、進むほど speedFrom から speedTo へ上がる
+function mz.update(dt)
+  local now = love.timer.getTime()
+  for i = #mz.fx, 1, -1 do
+    if now - mz.fx[i].t > mz.FX_SHOW then table.remove(mz.fx, i) end
+  end
+  if not timing or finished or not mz.cur then return end
+  if love.mouse.isDown(1) then                               -- 潰した粒をなぞると、そこへ引き返す
+    local mx, sy = mousePos()
+    if sy >= ROLL_TOUCH_TOP and sy <= ROLL_TOUCH_BOT then mz.walkTo(mx, sy + scrollY) end
+  end
+  local prev = scrollY
+  local q = clamp(mz.climbed() / math.max(1, rows - 1), 0, 1)
+  local v0, v1 = perColor(stage.speedFrom), perColor(stage.speedTo)
+  scrollY = scrollY - (v0 + (v1 - v0) * q) * dt
+  local y = mz.cur.y - scrollY                               -- いまの位置の、画面上の高さ
+  if y < mz.FOLLOW_Y then                                    -- 上へ進みすぎたら、シートを余分に送って追いかける
+    scrollY = scrollY - math.min(mz.FOLLOW_Y - y, (mz.FOLLOW_Y - y) * 6 * dt + 20 * dt)
+    mz.lift = 0                                              -- これより上へは上がらない
+  elseif mz.lift > 0 then                                    -- ボーナス: 位置が上がる(シートが巻き戻る)
+    local d = math.min(mz.lift, mz.LIFT_SPEED * dt, y - mz.FOLLOW_Y)
+    scrollY = scrollY + d
+    mz.lift = mz.lift - d
+  end
+  local d = prev - scrollY                                   -- このコマで送った量(巻き戻したときは負)
+  local rTop, rBot = rollerRadii()
+  roll.phTop = roll.phTop + d / rTop
+  roll.phBot = roll.phBot + d / rBot
+  if mz.cur.y - scrollY > ROLL_TOUCH_BOT then mz.over = true end   -- 下端まで流された
+end
+
 -- ステージごとの動き(love.update は LuaJIT の upvalue 上限 60 に近いので、ここにまとめる)
 local function updateMode(dt)
   if isRoller() then updateRoller(dt)
-  elseif isStack() then updateConfetti(dt) updateStack(dt) end
+  elseif isStack() then updateConfetti(dt) updateStack(dt)
+  elseif mz.on() then updateConfetti(dt) mz.update(dt) end
 end
 
 -- ステージの終わり。2つ目の戻り値が true のときは記録しない。
@@ -1330,6 +1594,24 @@ local function stageDone()
       Sound.playBuzzer()
     end
     return true, false
+  end
+  if mz.on() then
+    -- 迷路: ゴールの段に着いたらクリア(タイムを記録)。いまの位置が下端まで流されたらゲームオーバー(記録なし)
+    if roll.result then return true, roll.result ~= "clear" end
+    if mz.goal then
+      roll.result = "clear"
+      roll.clearAt = love.timer.getTime()
+      roll.celebrate = { title = "GOAL!", sub = "Congratulations!" }
+      spawnConfetti()
+      if Sound.playFanfare then Sound.playFanfare() end
+      return true, false
+    end
+    if mz.over then
+      roll.result = "over"
+      if Sound.playBuzzer then Sound.playBuzzer() end
+      return true, true
+    end
+    return false, false
   end
   if not isRoller() then return total > 0 and popped >= total, false end
   if roll.result then return true, roll.result == "timeup" end
@@ -1785,6 +2067,14 @@ local function drawFinishPanel()
   if isStack() then                                             -- 積もるシート: 点数と、消した片・AIR ボーナスの内訳
     items = { { text = roll.result == "over" and "GAME OVER" or "TIME UP!" }, { text = "Score " .. stk.score },
               { text = string.format("Lines %d   Air %d   Max combo %d", stk.lines, stk.air, roll.maxCombo) } }
+  elseif mz.on() then                                          -- 迷路: ゴールのタイムか、進んだ段数
+    local n, all = mz.climbed(), rows - 1
+    if roll.result == "clear" then
+      items = { { text = "GOAL!  " .. fmtTime(elapsed) } }
+    else
+      items = { { text = "GAME OVER" },
+                { text = string.format("Row %d / %d  (%d%%)", n, all, math.floor(n / all * 100 + 0.5)) } }
+    end
   elseif isEndless() then                                       -- エンドレスロール: 潰した個数と最大コンボ
     items = { { text = "TIME UP!" },
               { text = string.format("Popped %d   Max combo %d", popped, roll.maxCombo) } }
@@ -2113,8 +2403,8 @@ local function drawStack()
     end
   end
   local f = stk.flash                                             -- 最下列が消えたときの光
-  if f and now - f.t < STACK_FLASH then
-    local q = (now - f.t) / STACK_FLASH
+  if f and now - f.t < stk.FLASH then
+    local q = (now - f.t) / stk.FLASH
     love.graphics.setColor(1, 1, 1, 0.9 * (1 - q))
     love.graphics.rectangle("fill", B.x - 6, f.y - cell * 0.3 * q, B.w + 12, cell * (1 + 0.6 * q), 10, 10)
   end
@@ -2123,7 +2413,7 @@ local function drawStack()
   -- 「AIR! +5」「LINE! +10」の文字
   love.graphics.setFont(msgFont)
   for _, fx in ipairs(stk.fx) do
-    local q = (now - fx.t) / STACK_FX_SHOW
+    local q = (now - fx.t) / stk.FX_SHOW
     local tw = msgFont:getWidth(fx.text)
     local x = clamp(fx.x, tw / 2 + 8, view.w - tw / 2 - 8)
     local y = math.max(HUD_H + 16, fx.y - 50 * q)
@@ -2134,6 +2424,103 @@ local function drawStack()
     love.graphics.setColor(0.2, 0.3, 0.45, 0.5 * (1 - q))
     love.graphics.print(fx.text, -tw / 2 + 2, -msgFont:getHeight() / 2 + 2)
     love.graphics.setColor(1, 0.7, 0.15, 1 - q)                   -- 金色
+    love.graphics.print(fx.text, -tw / 2, -msgFont:getHeight() / 2)
+    love.graphics.pop()
+  end
+end
+
+---------------------------------------------------------------
+-- 描画: 迷路(Lv2-4)
+---------------------------------------------------------------
+-- シートに描かれた迷路の壁と、いまの位置の印(シートと一緒に動く層。見えている段だけ描く)
+function mz.draw()
+  local cols = stage.cols
+  local now = love.timer.getTime()
+  local x0, y0 = sheet.x, sheet.y
+  local ra = clamp(math.floor((scrollY + ROLL_TOP_CY - y0) / cell), 1, rows)
+  local rb = clamp(math.floor((scrollY + ROLL_BOT_CY - y0) / cell) + 1, 1, rows)
+
+  if ra == 1 then                                               -- ゴールの段: 金色の帯と GOAL の文字
+    love.graphics.setColor(1, 0.82, 0.25, 0.30 + 0.10 * math.sin(now * 4))
+    love.graphics.rectangle("fill", x0, y0, sheet.w, cell)
+    love.graphics.setFont(msgFont)
+    love.graphics.setColor(0.75, 0.45, 0.05, 0.85)
+    love.graphics.printf("G  O  A  L", x0, y0 + (cell - msgFont:getHeight()) / 2, sheet.w, "center")
+  end
+
+  love.graphics.setColor(0.22, 0.34, 0.58, 0.85)                -- 壁(ペンで描いた太い線)
+  love.graphics.setLineWidth(math.max(3, cell * 0.08))
+  for r = ra, rb do
+    local y = y0 + (r - 1) * cell
+    for c = 1, cols do
+      local x = x0 + (c - 1) * cell
+      if r > 1 and not mz.up[r][c] then love.graphics.line(x - 2, y, x + cell + 2, y) end
+      if c < cols and not mz.rt[r][c] then love.graphics.line(x + cell, y - 2, x + cell, y + cell + 2) end
+    end
+  end
+
+  for r = ra, rb do                                             -- 隠れたボーナス粒: たまに小さく光る
+    for c = 1, cols do
+      local b = mz.grid[r][c]
+      if b.bonus and not b.popped then
+        local k = math.max(0, math.sin(now * 1.7 + b.seed)) ^ 12
+        if k > 0.02 then
+          love.graphics.setColor(1, 0.95, 0.6, 0.8 * k)
+          love.graphics.circle("fill", b.x + b.rad * 0.3, b.y - b.rad * 0.3, b.rad * 0.16 * k)
+        end
+      end
+    end
+  end
+
+  local cur = mz.cur
+  if not cur then return end
+  local danger = cur.y - scrollY > ROLL_TOUCH_BOT - mz.DANGER * cell
+  local rgb = COLOR_RGB[colorMode]
+  if not finished then                                          -- 次に潰せる粒: 白い輪
+    love.graphics.setLineWidth(2)
+    for _, d in ipairs({ { 0, -1 }, { 0, 1 }, { -1, 0 }, { 1, 0 } }) do
+      local b = mz.grid[cur.r + d[2]] and mz.grid[cur.r + d[2]][cur.c + d[1]]
+      if b and not b.popped and mz.linked(cur, b) then
+        love.graphics.setColor(1, 1, 1, 0.55 + 0.35 * math.sin(now * 6))
+        love.graphics.circle("line", b.x, b.y, b.rad + 3)
+      end
+    end
+  end
+  local pulse = 1 + 0.08 * math.sin(now * 5)                    -- いまの位置: 色の輪。下端が近いと赤く点滅
+  if danger then
+    love.graphics.setColor(0.95, 0.25, 0.25, 0.55 + 0.45 * math.sin(now * 16))
+  else
+    love.graphics.setColor(rgb[1], rgb[2], rgb[3], 0.95)
+  end
+  love.graphics.setLineWidth(math.max(3, cell * 0.07))
+  love.graphics.circle("line", cur.x, cur.y, cell * 0.40 * pulse)
+  love.graphics.circle("fill", cur.x, cur.y, cell * 0.11)
+end
+
+-- 画面に固定の表示: 開始前の案内、下端の線、「UP +3」の文字
+function mz.drawOverlay()
+  local now = love.timer.getTime()
+  love.graphics.setColor(0.95, 0.35, 0.35, 0.45)                -- 下端の線(ここまで流されるとゲームオーバー)
+  love.graphics.setLineWidth(2)
+  for x = sheet.x, sheet.x + sheet.w - 8, 16 do love.graphics.line(x, ROLL_TOUCH_BOT, x + 8, ROLL_TOUCH_BOT) end
+  if not timing and not finished then
+    love.graphics.setFont(hudFont)
+    love.graphics.setColor(0.2, 0.3, 0.4, 0.75 + 0.25 * math.sin(now * 4))
+    love.graphics.printf("Pop the bubbles next to the ring\nand climb to the GOAL!",
+                         0, mz.START_Y + cell * 0.5 + 14, view.w, "center")
+  end
+  love.graphics.setFont(msgFont)
+  for _, fx in ipairs(mz.fx) do
+    local q = (now - fx.t) / mz.FX_SHOW
+    local tw = msgFont:getWidth(fx.text)
+    local x = clamp(fx.x, tw / 2 + 8, view.w - tw / 2 - 8)
+    local y = clamp(fx.y - scrollY - 30 - 50 * q, ROLL_TOUCH_TOP, ROLL_TOUCH_BOT)
+    love.graphics.push()
+    love.graphics.translate(x, y)
+    love.graphics.scale(1.3 * (1 + 0.4 * math.max(0, 1 - q / 0.15)))
+    love.graphics.setColor(0.2, 0.3, 0.45, 0.5 * (1 - q))
+    love.graphics.print(fx.text, -tw / 2 + 2, -msgFont:getHeight() / 2 + 2)
+    love.graphics.setColor(1, 0.7, 0.15, 1 - q)                 -- 金色
     love.graphics.print(fx.text, -tw / 2, -msgFont:getHeight() / 2)
     love.graphics.pop()
   end
@@ -2151,19 +2538,20 @@ local function drawSheetLayer()
         if b.popped then drawPopped(b) else drawIntact(b) end
       end
     end
+    if mz.on() then mz.draw() end
   end
   drawFilm()
   setScissor(0, clipTop(), view.w, clipBottom() - clipTop())
   drawCutEdges()
   love.graphics.pop()
   love.graphics.setScissor()
-  if isRoller() then drawRollers() end
+  if mz.rollers() then drawRollers() end
 end
 
 local function drawPlay()
   if isStack() then drawStack() else drawSheetLayer() end
 
-  if scrollY > 1 and not isRoller() then                         -- 上部の表示エリアの下に薄い影
+  if scrollY > 1 and not mz.rollers() then                         -- 上部の表示エリアの下に薄い影
     for i = 0, 7 do
       love.graphics.setColor(0.1, 0.2, 0.3, 0.10 * (1 - i / 8))
       love.graphics.rectangle("fill", 0, HUD_H + i, view.w, 1)
@@ -2178,6 +2566,8 @@ local function drawPlay()
   love.graphics.setColor(0.2, 0.3, 0.4)
   if isStack() then                                                -- 積もるシートは点数
     love.graphics.print("Score " .. stk.score, 36, 18)
+  elseif mz.on() then                                             -- 迷路は進んだ段数
+    love.graphics.print(string.format("Row %d / %d", mz.climbed(), rows - 1), 36, 18)
   elseif isEndless() then                                          -- エンドレスロールは潰した個数だけ
     love.graphics.print(popped .. " pops", 36, 18)
   else
@@ -2204,9 +2594,10 @@ local function drawPlay()
     love.graphics.setColor(1, 1, 1)
     love.graphics.printf(START_LABEL, r.x, r.y + (r.h - msgFont:getHeight()) / 2, r.w, "center")
   end
+  if mz.on() then mz.drawOverlay() end
   if not entering then drawBar() end                              -- 入力中はうっかり押さないよう隠す
   if isEndless() or isStack() then drawComboFx() drawMilestone() end
-  if needsStart() and roll.celebrate then drawCelebration() elseif isEndless() or isStack() then drawConfetti() end
+  if (needsStart() or mz.on()) and roll.celebrate then drawCelebration() elseif isEndless() or isStack() then drawConfetti() end
   if entering then drawEntryPanel() elseif finished then drawFinishPanel() end
 
   if useFinger() then                                            -- 指のカーソル(いちばん手前)

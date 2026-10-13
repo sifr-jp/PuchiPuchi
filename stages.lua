@@ -41,6 +41,12 @@
 --   fallFrom    mode = "stack" の片の落ちる速さ(px/秒)。fallTo まで時間とともに上がる
 --   spawnFrom   mode = "stack" の片を出す間隔(秒)。spawnTo まで時間とともに短くなる
 --   soundPitch, fingerScale も色ごとの表にできる
+--               "maze": 迷路(Lv2-4)。迷路の描かれたシートが下へ流れ、いまの位置の隣の粒を潰して上のゴールへ進む
+--   rows        mode = "maze" ではゴールまでの段数。色ごとの表にできる
+--   band        mode = "maze" の帯の高さ(段)。行き止まりの深さはここまで。大きいほど難しい。色ごとの表にできる
+--   links       mode = "maze" で帯と帯をつなぐ出口の数。少ないほど難しい。色ごとの表にできる
+--   speedFrom   mode = "maze" の送り始めの速さ(px/秒)。進むほど speedTo へ上がる。色ごとの表にできる
+--   bonusRate   mode = "maze" で行き止まりにボーナス粒(位置が1段か3段上がる)を隠す割合。省略時は 0.5
 
 -- 潰せる粒の数: 奇数行は cols 個、偶数行は両端が半割なので (cols - 1) 個
 local function count(cols, rows)
@@ -115,5 +121,18 @@ return {
     bg = { 0.92, 0.91, 0.98 },
     finger = true, scroll = false,
     record = { n = 3, initials = true, score = true },
+  },
+  {
+    id = "2-4", title = "Lv2-4  Maze", level = 2, mode = "maze",
+    sub = "Climb to the goal  /  top 3",
+    free = false, cols = 8, rows = { blue = 50, yellow = 100, pink = 200 },
+    hardRatio = 0, pressTime = 0.10, softPop = true, popFx = true,
+    band = { blue = 3, yellow = 4, pink = 5 }, links = { blue = 2, yellow = 1, pink = 1 },
+    maxPath = { blue = 10, yellow = 12, pink = 14 },
+    speedFrom = { blue = 16, yellow = 20, pink = 24 }, speedTo = { blue = 26, yellow = 30, pink = 36 },
+    bonusRate = 0.2,
+    bg = { 0.90, 0.96, 0.91 },
+    finger = true, scroll = false,
+    record = { n = 3, initials = true },
   },
 }
